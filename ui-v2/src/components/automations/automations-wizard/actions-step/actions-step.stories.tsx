@@ -7,12 +7,7 @@ import { buildApiUrl } from "@tests/utils/handlers";
 import { http, HttpResponse } from "msw";
 import { ActionsStep } from "./actions-step";
 
-const MOCK_DATA = [
-	createFakeAutomation(),
-	createFakeAutomation(),
-	createFakeAutomation(),
-	createFakeAutomation(),
-];
+const MOCK_AUTOMATIONS_DATA = Array.from({ length: 5 }, createFakeAutomation);
 
 const meta = {
 	title: "Components/Automations/Wizard/ActionsStep",
@@ -23,7 +18,7 @@ const meta = {
 		msw: {
 			handlers: [
 				http.post(buildApiUrl("/automations/filter"), () => {
-					return HttpResponse.json(MOCK_DATA);
+					return HttpResponse.json(MOCK_AUTOMATIONS_DATA);
 				}),
 			],
 		},
