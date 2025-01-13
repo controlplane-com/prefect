@@ -1,8 +1,10 @@
-import { DeploymentWithFlow } from "@/api/deployments";
+import { components } from "@/api/prefect";
 import { faker } from "@faker-js/faker";
 import { createFakeSchedule } from "./create-fake-schedule";
 
-export function createFakeDeployment(): DeploymentWithFlow {
+export function createFakeDeployment(
+	overrides?: Partial<components["schemas"]["DeploymentResponse"]>,
+): components["schemas"]["DeploymentResponse"] {
 	return {
 		id: faker.string.uuid(),
 		created: faker.date.recent().toISOString(),
@@ -19,11 +21,6 @@ export function createFakeDeployment(): DeploymentWithFlow {
 			{ length: faker.number.int({ min: 0, max: 3 }) },
 			() => createFakeSchedule(),
 		),
-		flow: {
-			id: faker.string.uuid(),
-			created: faker.date.recent().toISOString(),
-			updated: faker.date.recent().toISOString(),
-			name: faker.company.catchPhrase().toLowerCase().replace(/\s+/g, "-"),
-		},
+		...overrides,
 	};
 }
