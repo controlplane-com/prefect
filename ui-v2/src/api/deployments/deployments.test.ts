@@ -1,5 +1,5 @@
-import { createFakeDeployment, createFakeFlow } from "@/mocks";
-import { QueryClient, useQuery, useSuspenseQuery } from "@tanstack/react-query";
+import { createFakeDeployment } from "@/mocks/create-fake-deployment";
+import { QueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { buildApiUrl, createWrapper, server } from "@tests/utils";
 import { http, HttpResponse } from "msw";
@@ -8,7 +8,6 @@ import type { Deployment } from "./index";
 import {
 	buildCountDeploymentsQuery,
 	buildPaginateDeploymentsQuery,
-	buildPaginateDeploymentsWithFlowQuery,
 } from "./index";
 
 describe("deployments api", () => {
@@ -118,48 +117,6 @@ describe("deployments api", () => {
 			await waitFor(() => {
 				expect(result.current.data).toBe(1);
 			});
-		});
-	});
-
-	describe("buildPaginateDeploymentsWithFlowQuery", () => {
-		it("fetches deplyoments pagination and flow filter APIs and joins data", async () => {
-			const MOCK_DEPLOYMENTS = [
-				createFakeDeployment({ id: "0", flow_id: "a" }),
-				createFakeDeployment({ id: "1", flow_id: "a" }),
-			];
-			const MOCK_FLOW = createFakeFlow({ id: "a" });
-
-			server.use(
-				http.post(buildApiUrl("/deployments/paginate"), () => {
-					return HttpResponse.json({
-						results: MOCK_DEPLOYMENTS,
-						count: MOCK_DEPLOYMENTS.length,
-						page: 1,
-						pages: 1,
-						limit: 10,
-					});
-				}),
-				http.post(buildApiUrl("/flows/filter"), () => {
-					return HttpResponse.json([MOCK_FLOW]);
-				}),
-			);
-
-			const queryClient = new QueryClient();
-			const { result } = renderHook(
-				() => useQuery(buildPaginateDeploymentsWithFlowQuery()),
-				{ wrapper: createWrapper({ queryClient }) },
-			);
-
-			await waitFor(() => {
-				expect(result.current.isSuccess).toBe(true);
-			});
-
-			const EXPECTED = MOCK_DEPLOYMENTS.map((deployment) => ({
-				...deployment,
-				flow: MOCK_FLOW,
-			}));
-
-			expect(EXPECTED).toEqual(result.current.data?.results);
 		});
 	});
 });
