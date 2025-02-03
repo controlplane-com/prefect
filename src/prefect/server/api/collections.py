@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Any, Dict
 
 import httpx
@@ -13,10 +14,14 @@ router = PrefectRouter(prefix="/collections", tags=["Collections"])
 GLOBAL_COLLECTIONS_VIEW_CACHE: TTLCache = TTLCache(maxsize=200, ttl=60 * 10)
 
 REGISTRY_VIEWS = "https://raw.githubusercontent.com/PrefectHQ/prefect-collection-registry/6939db85b49e4cb4c009124d8b12052a7663be8a/views"
+
+LOCAL_VIEWS_DIR = os.path.join(os.path.dirname(__file__), "collections_data", "views")
+WORKER_METADATA = os.path.join(LOCAL_VIEWS_DIR, "aggregate-worker-metadata.json")
+
 KNOWN_VIEWS = {
     "aggregate-block-metadata": f"{REGISTRY_VIEWS}/aggregate-block-metadata.json",
     "aggregate-flow-metadata": f"{REGISTRY_VIEWS}/aggregate-flow-metadata.json",
-    "aggregate-worker-metadata": f"{REGISTRY_VIEWS}/aggregate-worker-metadata.json",
+    "aggregate-worker-metadata": WORKER_METADATA,
     "demo-flows": f"{REGISTRY_VIEWS}/demo-flows.json",
 }
 
