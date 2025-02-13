@@ -1,10 +1,10 @@
 import asyncio
 import copy
-import datetime
 import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
@@ -22,7 +22,7 @@ from prefect._internal.schemas.validators import (
     validate_k8s_job_compatible_values,
     validate_k8s_job_required_components,
 )
-from prefect.blocks.cpln import CplnClient, CplnConfig
+from prefect.blocks.cpln import CplnClient, CplnInfrastructureConfig
 from prefect.exceptions import (
     InfrastructureError,
     InfrastructureNotAvailable,
@@ -51,6 +51,7 @@ RETRY_MAX_ATTEMPTS = 3
 RETRY_MIN_DELAY_SECONDS = 1
 RETRY_MIN_DELAY_JITTER_SECONDS = 0
 RETRY_MAX_DELAY_JITTER_SECONDS = 3
+RETRY_WORKLOAD_READY_CHECK_SECONDS = 2
 
 # API Request Configuration
 HTTP_REQUEST_TIMEOUT: int = 60
@@ -94,7 +95,7 @@ class CplnLogsMonitor:
         self._interval_seconds = interval_seconds
         self.logs_url = os.getenv("CPLN_LOGS_ENDPOINT", LOGS_URL)
 
-        # Defined attirbutes
+        # Defined attributes
         self.completed = False
         self.job_status = None
         self._websocket = None
@@ -254,9 +255,45 @@ class CplnLogsMonitor:
 class CplnKubernetesConverter:
     """Convert a Kubernetes job manifest to a Control Plane cron workload manifest."""
 
-    def __init__(self, namespace: str, k8s_job: KubernetesObjectManifest):
+    def __init__(
+        self,
+        logger: logging,
+        client: CplnClient,
+        org: str,
+        namespace: str,
+        k8s_job: KubernetesObjectManifest,
+    ):
+        # Set received parameters
+        self._logger = logger
+        self._client = client
+        self._org = org
         self._namespace = namespace
         self._k8s_job = k8s_job
+
+        # Converter related
+        self._is_identity_overridden = False
+
+        # Extract job name from the manifest
+        self._k8s_job_name = k8s_job["metadata"]["generateName"]
+
+        # Define identity and policy name
+        self._policy_name = f"{self._k8s_job_name}-reveal-policy"
+        self._identity_name = f"{self._k8s_job_name}-identity"
+
+        # Define identity and policy links
+        self._policy_parent_link = f"/org/{self._org}/policy"
+        self._policy_link = f"/org/{self._org}/policy/{self._policy_name}"
+        self._identity_parent_link = f"/org/{self._org}/gvc/{self._namespace}/identity"
+        self._identity_link = (
+            f"/org/{self._org}/gvc/{self._namespace}/identity/{self._identity_name}"
+        )
+
+        # Get identity and policy manifests
+        self._policy = self._get_policy()
+        self._identity = self._get_identity()
+
+        # Define a list for storing secrets that we will add to the policy later on
+        self._secret_names = []
 
     ### Public Methods ###
 
@@ -284,7 +321,7 @@ class CplnKubernetesConverter:
             "defaultOptions": {
                 "capacityAI": False,
                 "debug": False,
-                "suspend": True,  # Prefect will be the one triggering schedules jobs, not us
+                "suspend": True,  # Prefect will be the one triggering scheduled jobs, not us
             },
             "firewallConfig": {
                 "external": {
@@ -302,8 +339,11 @@ class CplnKubernetesConverter:
             },
         }
 
-        # Set identity link
+        # Set identity link and override default identity
         if pod_spec.get("serviceAccountName"):
+            # Indicate that the default identity has been overridden
+            self._is_identity_overridden = True
+
             # Extract the service account name
             service_account_name = pod_spec["serviceAccountName"]
 
@@ -311,14 +351,381 @@ class CplnKubernetesConverter:
             workload_spec[
                 "identity_link"
             ] = f"//gvc/{self._namespace}/identity/{service_account_name}"
+        else:
+            # Populate secret names and attach them to the policy
+            for secret_name in self._secret_names:
+                # Update the policy manifest with a new secret link
+                self._policy["targetLinks"].append(f"//secret/{secret_name}")
 
         # Return the Control Plane cron workload manifest
         return {
             "kind": "workload",
-            "name": self._k8s_job["metadata"]["generateName"],
+            "name": self._k8s_job_name,
             "tags": self._k8s_job["metadata"]["labels"],
             "spec": workload_spec,
         }
+
+    def create_reliant_resources(self):
+        """
+        Create and apply the required identity and policy resources.
+
+        This method applies the identity and policy by making requests to the client
+        and logs the creation of each resource.
+        """
+
+        # Apply identity individually
+        self._client.put(self._identity_parent_link, self._identity)
+        self._logger.info(f"Created {self._identity_link}")
+
+        # Apply policy individually
+        self._client.put(self._policy_parent_link, self._policy)
+        self._logger.info(f"Created {self._policy_link}")
+
+    def delete_reliant_resources(self):
+        """
+        Delete the previously created identity and policy resources.
+
+        This method removes the identity and policy by making delete requests to the client
+        and logs the deletion of each resource.
+        """
+
+        # Delete identity individually
+        self._client.delete(self._identity_link)
+        self._logger.info(f"Deleted {self._identity_link}")
+
+        # Delete policy individually
+        self._client.delete(self._policy_link)
+        self._logger.info(f"Deleted {self._policy_link}")
+
+    ### Private Methods ###
+
+    def _get_identity(self):
+        """
+        Construct and return the identity manifest.
+
+        Returns:
+            dict: A dictionary representing the identity manifest, including its kind and name.
+        """
+
+        # Construct and return the identity manifest
+        return {"kind": "identity", "name": self._identity_name}
+
+    def _get_policy(self):
+        """
+        Construct and return the policy manifest.
+
+        Returns:
+            dict: A dictionary representing the policy manifest, including its name,
+            target kind, target links, and bindings that grant reveal permissions.
+        """
+
+        # Construct and return the policy manifest
+        return {
+            "kind": "policy",
+            "name": self._policy_name,
+            "targetKind": "secret",
+            "targetLinks": [],  # Empty for now, we will fill later when convert() is called
+            "bindings": [
+                {
+                    # Give reveal permissions to the identity that we will later attached to the cron workload
+                    "permissions": ["reveal"],
+                    "principalLinks": [self._identity_link],
+                }
+            ],
+        }
+
+    def _build_cpln_workload_containers(
+        self, kubernetes_volumes: dict, kubernetes_container: dict
+    ) -> list:
+        """
+        Builds a Control Plane cron workload container from a Kubernetes container.
+
+        Args:
+            kubernetes_volumes: The Kubernetes Job volumes.
+            kubernetes_container: The Kubernetes container.
+
+        Returns:
+            list: The Control Plane cron workload containers.
+        """
+
+        # Get container resources
+        resources = self._convert_kubernetes_job_resources(kubernetes_container)
+
+        # Build workload container
+        container = {
+            "name": kubernetes_container["name"],
+            "image": kubernetes_container["image"],
+            "cpu": resources["cpu"],
+            "memory": resources["memory"],
+        }
+
+        # Set command if specified
+        if kubernetes_container.get("command"):
+            container["command"] = " ".join(kubernetes_container["command"])
+
+        # Set args if specified
+        if kubernetes_container.get("args"):
+            container["args"] = kubernetes_container["args"]
+
+        # Set working directory
+        if kubernetes_container.get("workingDir"):
+            container["workingDir"] = kubernetes_container["workingDir"]
+
+        # Set environment variables
+        if kubernetes_container.get("env"):
+            container["env"] = kubernetes_container["env"]
+
+        # Process envFrom attribute and merge it with container env
+        if kubernetes_container.get("envFrom"):
+            container["env"] += self._process_env_from(kubernetes_container["envFrom"])
+
+        # Set volume mounts
+        if kubernetes_container.get("volumeMounts"):
+            container["volumes"] = self._build_cpln_workload_volumes(
+                kubernetes_volumes, kubernetes_container["volumeMounts"]
+            )
+
+        # Set lifecycle
+        if kubernetes_container.get("lifecycle"):
+            container["lifecycle"] = kubernetes_container["lifecycle"]
+
+        # Return the containers list
+        return [container]
+
+    def _process_env_from(self, kubernetes_env_from: List[dict]) -> List[dict]:
+        """
+        Process environment variables from Kubernetes environment sources.
+
+        Args:
+            kubernetes_env_from (List[dict]): A list of environment sources that can reference
+            ConfigMaps or Secrets.
+
+        Returns:
+            List[dict]: A list of processed environment variables extracted from secrets.
+        """
+
+        # Construct the result
+        env = []
+
+        # Iterate over each envFrom source
+        for source in kubernetes_env_from:
+            if "configMapRef" not in source and "secretRef" not in source:
+                continue
+
+            # Prepare a variable to store the name of the secret
+            secret_name = ""
+
+            # Extract secret name if found, skip source otherwise
+            if source.get("configMapRef"):
+                secret_name = source["configMapRef"].get("name", "")
+            elif source.get("secretRef"):
+                secret_name = source["secretRef"].get("name", "")
+            else:
+                # In case there are no secret reference, there is nothing to do basically, let's skip this source
+                continue
+
+            # Secret name cannot be an empty string, throw a ValueError exception
+            if not secret_name:
+                raise ValueError(
+                    "A Secret name cannot be empty in a job manifest. Either configMapRef or secretRef references an empty name in envFrom."
+                )
+
+            # Prepare secret link
+            secret_link = f"/org/{self._org}/secret/{secret_name}/-reveal"
+
+            # Fetch the secret by its name
+            secret = self._client.get(secret_link)
+
+            # Extract secret type
+            secret_type = secret["type"]
+
+            # Validate that the secret is of type dictionary
+            if secret_type != "dictionary":
+                raise ValueError(
+                    f"The secret with the name '{secret_name}' that is being referenced in 'envFrom' must be of type 'dictionary', type found '{secret_type}'."
+                )
+
+            # For every key in the secret data, create an environment variable and assign it its value
+            for key in secret.get("data", {}).keys():
+                # Prepare the name of the environment variable
+                name = key
+                value = f"cpln://secret/{secret_name}.{key}"
+
+                # Append a prefix to the environment variable name if specified in the source
+                if source.get("prefix"):
+                    name = source["prefix"] + key
+
+                # Add the new environment variable to the result
+                env.append({"name": name, "value": value})
+
+            # Finally keep track of this secret so we can create a policy for it later
+            self._secret_names.append(secret_name)
+
+        # Return the result
+        return env
+
+    def _build_cpln_workload_volumes(
+        self, kubernetes_volumes, kubernetes_volume_mounts
+    ) -> list:
+        """
+        Process the volume mounts specified for a container.
+
+        Args:
+            kubernetes_volumes: The Kubernetes Job volumes.
+            kubernetes_volume_mounts: The Kubernetes container volume mounts.
+
+        Returns:
+            list: The Control Plane cron workload volumes.
+        """
+
+        # Initialize the volumes list
+        volumes = []
+
+        # Process each volume mount
+        for k8s_volume_mount in kubernetes_volume_mounts:
+            # Skip if the volume is not found
+            if not kubernetes_volumes.get(k8s_volume_mount["name"]):
+                continue
+
+            # Get the volume
+            k8s_volume = kubernetes_volumes[k8s_volume_mount["name"]]
+
+            # Process persistent volume claims
+            if k8s_volume.get("persistentVolumeClaim"):
+                uri = f"cpln://volumeset/{k8s_volume['persistentVolumeClaim']['claimName']}"
+                path = k8s_volume_mount["mountPath"]
+
+                # Append volume to the list
+                volumes.append({"uri": uri, "path": path})
+
+                # Skip to the next volume
+                continue
+
+            # Process config maps
+            if k8s_volume.get("configMap"):
+                self._mount_volume(
+                    volumes,
+                    k8s_volume_mount,
+                    k8s_volume["configMap"]["name"],
+                    k8s_volume["configMap"].get("items"),
+                )
+
+                # Skip to the next volume
+                continue
+
+            # Process secrets
+            if k8s_volume.get("secret"):
+                self._mount_volume(
+                    volumes,
+                    k8s_volume_mount,
+                    k8s_volume["secret"]["secretName"],
+                    k8s_volume["secret"].get("items"),
+                )
+
+                # Skip to the next volume
+                continue
+
+            # Process projected volumes
+            if k8s_volume.get("projected"):
+                # Process sources
+                for projected_source in k8s_volume["projected"]["sources"]:
+                    # Process config maps
+                    if projected_source.get("configMap"):
+                        self._mount_volume(
+                            volumes,
+                            k8s_volume_mount,
+                            projected_source["configMap"]["name"],
+                            projected_source["configMap"].get("items"),
+                        )
+                    # Process secrets
+                    if projected_source.get("secret"):
+                        self._mount_volume(
+                            volumes,
+                            k8s_volume_mount,
+                            projected_source["secret"]["name"],
+                            projected_source["secret"].get("items"),
+                        )
+
+                # Skip to the next volume
+                continue
+
+            # Mount a shared volume
+            if k8s_volume.get("emptyDir"):
+                uri = f"scratch://{k8s_volume['name']}"
+                path = k8s_volume_mount["mountPath"]
+
+                # Append subpath if it exists
+                if k8s_volume_mount.get("subPath"):
+                    path = f"{path}/{k8s_volume_mount['subPath']}"
+
+                # Append the volume to the list
+                volumes.append({"uri": uri, "path": path})
+
+            # Handle next volume
+
+        # Return the volumes list
+        return volumes
+
+    def _mount_volume(
+        self,
+        volumes: List[dict],
+        k8s_volume_mount: dict,
+        secret_name: str,
+        volume_items: Optional[List[dict]] = None,
+    ) -> None:
+        """
+        Mount a volume to the container.
+
+        Args:
+            volumes: The list of volumes to be updated.
+            k8s_volume_mount: The Kubernetes volume mount specification.
+            secret_name: The name of the secret to be mounted.
+            volume_items: Optional list of volume items.
+        """
+
+        # Prepare volume
+        uri = f"cpln://secret/{secret_name}"
+        path = k8s_volume_mount["mountPath"]
+
+        # Keep track of this secret so we can create a policy for it later
+        self._secret_names.append(secret_name)
+
+        # Process items and return
+        if volume_items:
+            # Iterate over each item and add a new volume
+            for item in volume_items:
+                # If a sub path is specified, then we will only pick and handle one item
+                if k8s_volume_mount.get("subPath"):
+                    # Find the path that the sub path is referencing
+                    if k8s_volume_mount["subPath"] == item["path"]:
+                        # Add new volume
+                        volumes.append(
+                            {
+                                "uri": f"{uri}.{item['key']}",
+                                "path": f"{path}/{item['path']}",
+                            }
+                        )
+
+                        # Exit iteration because we have found the item we are looking for
+                        break
+
+                    # Skip to next iteration in order to find the specified sub path
+                    continue
+
+                # Add a new volume for each item
+                volumes.append(
+                    {"uri": f"{uri}.{item['key']}", "path": f"{path}/{item['path']}"}
+                )
+
+            # Volume items case has been handled, return
+            return
+
+        # Reference secret property
+        if k8s_volume_mount.get("subPath"):
+            uri = f"{uri}.{k8s_volume_mount['subPath']}"
+
+        # Add a new volume
+        volumes.append({"uri": uri, "path": path})
 
     ### Private Static Methods ###
 
@@ -343,64 +750,6 @@ class CplnKubernetesConverter:
 
         # Return the volume name to volume mapping
         return volume_name_to_volume
-
-    @staticmethod
-    def _build_cpln_workload_containers(
-        kubernetes_volumes: dict, kubernetes_container: dict
-    ) -> list:
-        """
-        Builds a Control Plane cron workload container from a Kubernetes container.
-
-        Args:
-            kubernetes_volumes: The Kubernetes Job volumes.
-            kubernetes_container: The Kubernetes container.
-
-        Returns:
-            list: The Control Plane cron workload containers.
-        """
-
-        # Get container resources
-        resources = CplnKubernetesConverter._convert_kubernetes_job_resources(
-            kubernetes_container
-        )
-
-        # Build workload container
-        container = {
-            "name": kubernetes_container["name"],
-            "image": kubernetes_container["image"],
-            "cpu": resources["cpu"],
-            "memory": resources["memory"],
-            "args": kubernetes_container["args"],
-        }
-
-        # Set command if specified
-        if kubernetes_container.get("command"):
-            container["command"] = " ".join(kubernetes_container["command"])
-
-        # Set args if specified
-        if kubernetes_container.get("args"):
-            container["args"] = kubernetes_container["args"]
-
-        # Set working directory
-        if kubernetes_container.get("workingDir"):
-            container["workingDir"] = kubernetes_container["workingDir"]
-
-        # Set environment variables
-        if kubernetes_container.get("env"):
-            container["env"] = kubernetes_container["env"]
-
-        # Set volume mounts
-        if kubernetes_container.get("volumeMounts"):
-            container["volumes"] = CplnKubernetesConverter._build_cpln_workload_volumes(
-                kubernetes_volumes, kubernetes_container["volumeMounts"]
-            )
-
-        # Set lifecycle
-        if kubernetes_container.get("lifecycle"):
-            container["lifecycle"] = kubernetes_container["lifecycle"]
-
-        # Return the containers list
-        return [container]
 
     @staticmethod
     def _build_cpln_workload_job_spec(pod_spec: dict) -> dict:
@@ -471,173 +820,12 @@ class CplnKubernetesConverter:
             "memory": memory,
         }
 
-    @staticmethod
-    def _build_cpln_workload_volumes(
-        kubernetes_volumes, kubernetes_volume_mounts
-    ) -> list:
-        """
-        Process the volume mounts specified for a container.
 
-        Args:
-            kubernetes_volumes: The Kubernetes Job volumes.
-            kubernetes_volume_mounts: The Kubernetes container volume mounts.
-
-        Returns:
-            list: The Control Plane cron workload volumes.
-        """
-
-        # Initialize the volumes list
-        volumes = []
-
-        # Process each volume mount
-        for k8s_volume_mount in kubernetes_volume_mounts:
-            # Skip if the volume is not found
-            if not kubernetes_volumes.get(k8s_volume_mount["name"]):
-                continue
-
-            # Get the volume
-            k8s_volume = kubernetes_volumes[k8s_volume_mount["name"]]
-
-            # Process persistent volume claims
-            if k8s_volume.get("persistentVolumeClaim"):
-                uri = f"cpln://volumeset/{k8s_volume['persistentVolumeClaim']['claimName']}"
-                path = k8s_volume_mount["mountPath"]
-
-                # Append volume to the list
-                volumes.append({"uri": uri, "path": path})
-
-                # Skip to the next volume
-                continue
-
-            # Process config maps
-            if k8s_volume.get("configMap"):
-                CplnKubernetesConverter._mount_volume(
-                    kubernetes_volumes,
-                    k8s_volume_mount,
-                    k8s_volume["configMap"]["name"],
-                    k8s_volume["configMap"].get("items"),
-                )
-
-                # Skip to the next volume
-                continue
-
-            # Process secrets
-            if k8s_volume.get("secret"):
-                CplnKubernetesConverter._mount_volume(
-                    kubernetes_volumes,
-                    k8s_volume_mount,
-                    k8s_volume["secret"]["secretName"],
-                    k8s_volume["secret"].get("items"),
-                )
-
-                # Skip to the next volume
-                continue
-
-            # Process projected volumes
-            if k8s_volume.get("projected"):
-                # Process sources
-                for projected_source in k8s_volume["projected"]["sources"]:
-                    # Process config maps
-                    if projected_source.get("configMap"):
-                        CplnKubernetesConverter._mount_volume(
-                            kubernetes_volumes,
-                            k8s_volume_mount,
-                            projected_source["configMap"]["name"],
-                            projected_source["configMap"].get("items"),
-                        )
-                    # Process secrets
-                    if projected_source.get("secret"):
-                        CplnKubernetesConverter._mount_volume(
-                            kubernetes_volumes,
-                            k8s_volume_mount,
-                            projected_source["secret"]["name"],
-                            projected_source["secret"].get("items"),
-                        )
-
-                # Skip to the next volume
-                continue
-
-            # Mount a shared volume
-            if k8s_volume.get("emptyDir"):
-                uri = f"scratch://{k8s_volume['name']}"
-                path = k8s_volume_mount["mountPath"]
-
-                # Append subpath if it exists
-                if k8s_volume_mount.get("subPath"):
-                    path = f"{path}/{k8s_volume_mount['subPath']}"
-
-                # Append the volume to the list
-                volumes.append({"uri": uri, "path": path})
-
-            # Handle next volume
-
-        # Return the volumes list
-        return volumes
-
-    @staticmethod
-    def _mount_volume(
-        volumes: List[dict],
-        k8s_volume_mount: dict,
-        secret_name: str,
-        volume_items: Optional[List[dict]] = None,
-    ) -> None:
-        """
-        Mount a volume to the container.
-
-        Args:
-            volumes: The list of volumes to be updated.
-            k8s_volume_mount: The Kubernetes volume mount specification.
-            secret_name: The name of the secret to be mounted.
-            volume_items: Optional list of volume items.
-        """
-
-        # Prepare volume
-        uri = f"cpln://secret/{secret_name}"
-        path = k8s_volume_mount["mountPath"]
-
-        # Process items and return
-        if volume_items:
-            # Iterate over each item and add a new volume
-            for item in volume_items:
-                # If a sub path is specified, then we will only pick and handle one item
-                if k8s_volume_mount.get("subPath"):
-                    # Find the path that the sub path is referencing
-                    if k8s_volume_mount["subPath"] == item["path"]:
-                        # Add new volume
-                        volumes.append(
-                            {
-                                "uri": f"{uri}.{item['key']}",
-                                "path": f"{path}/{item['path']}",
-                            }
-                        )
-
-                        # Exit iteration because we have found the item we are looking for
-                        break
-
-                    # Skip to next iteration in order to find the specified sub path
-                    continue
-
-                # Add a new volume for each item
-                volumes.append(
-                    {"uri": f"{uri}.{item['key']}", "path": f"{path}/{item['path']}"}
-                )
-
-            # Volume items case has been handled, return
-            return
-
-        # Reference secret property
-        if k8s_volume_mount.get("subPath"):
-            uri = f"{uri}.{k8s_volume_mount['subPath']}"
-
-        # Add a new volume
-        volumes.append({"uri": uri, "path": path})
-
-
-class CplnJobResult(InfrastructureResult):
+class CplnInfrastructureResult(InfrastructureResult):
     """Contains information about the final state of a completed Kubernetes Job"""
 
 
-class CplnJob(Infrastructure):
+class CplnInfrastructure(Infrastructure):
     """
     Runs a command as a Control Plane Job.
 
@@ -662,15 +850,15 @@ class CplnJob(Infrastructure):
         stream_output: If set, stream output from the job to local standard output.
     """
 
-    _block_type_name = "Control Plane Job"
+    _block_type_name = "Control Plane Infrastructure"
     _logo_url = "https://console.cpln.io/resources/logos/controlPlaneLogoOnly.svg"
     _documentation_url = "https://docs.controlplane.com"
     _api_dns_name: Optional[str] = None  # Replaces 'localhost' in API URL
 
-    type: Literal["cpln-job"] = Field(
-        default="cpln-job", description="The type of infrastructure."
+    type: Literal["cpln-infrastructure"] = Field(
+        default="cpln-infrastructure", description="The type of infrastructure."
     )
-    config: Optional[CplnConfig] = Field(
+    config: Optional[CplnInfrastructureConfig] = Field(
         default=None, description="The Control Plane config to use for this job."
     )
     org: Optional[str] = Field(
@@ -700,7 +888,7 @@ class CplnJob(Infrastructure):
         default=None, description="The Control Plane identity to use for this job."
     )
     job: KubernetesObjectManifest = Field(
-        default_factory=lambda: CplnJob.base_job_manifest(),
+        default_factory=lambda: CplnInfrastructure.base_job_manifest(),
         description="The base manifest for the Kubernetes Job.",
         title="Base Job Manifest",
     )
@@ -811,10 +999,28 @@ class CplnJob(Infrastructure):
     async def run(
         self,
         task_status: Optional[anyio.abc.TaskStatus] = None,
-    ) -> CplnJobResult:
+    ) -> CplnInfrastructureResult:
         # Raise a ValueError if no command was specified
         if not self.command:
-            raise ValueError("Control Plane job cannot be run with empty command.")
+            raise ValueError("Control Plane job cannot be run with an empty command.")
+
+        # Raise a ValueError if org is not specified
+        if not self.org:
+            raise ValueError(
+                "Control Plane job cannot be run with an empty org. Please specify an organization in the infrastructure block."
+            )
+
+        # Raise a ValueError if namespace is not specified
+        if not self.namespace:
+            raise ValueError(
+                "Control Plane job cannot be run with an empty namespace. Please specify a namespace in the infrastructure block."
+            )
+
+        # Raise a ValueError if location is not specified
+        if not self.location:
+            raise ValueError(
+                "Control Plane job cannot be run with an empty location. Please specify a location in the infrastructure block."
+            )
 
         # Build the Kubernetes job manifest
         k8s_job = self._build_job()
@@ -825,24 +1031,34 @@ class CplnJob(Infrastructure):
         # Log a message to indicate that the job is being created
         self.logger.info("Creating Control Plane job...")
 
+        # Initialize the Control Plane Kubernetes converter
+        self.cpln_k8s_converter = CplnKubernetesConverter(
+            self.logger, client, self.org, self.namespace, k8s_job
+        )
+
         # Create the cron workload
-        workload = self._create_workload(k8s_job, client)
+        workload = self._create_workload(self.cpln_k8s_converter, client)
 
         # Extract the job name from the job manifest
         workload_name = workload["name"]
 
-        # Log a message indicating wait duration
-        self.logger.info("Waiting 15 seconds before starting the job")
+        # Log a message to indicate that we are waiting for workload readiness
+        self.logger.info(
+            f"Waiting for the cron workload '{workload_name}' to become ready..."
+        )
 
-        # Wait a couple of seconds before starting the job
-        await asyncio.sleep(15)
+        # Wait for the workload to become ready before starting the job
+        self._wait_until_ready(workload_name, client)
+
+        # Log a message to indicate that workload is ready
+        self.logger.info("Workload is ready!")
 
         # Start the job
         job_id = self._start_job(client, workload)
 
         # Log the successful start of the job and the job ID
         self.logger.info(
-            f"[Infrastructure.CplnJob] Started job with ID: {job_id} in location {self.location}"
+            f"[CplnInfrastructure] Started job with ID: {job_id} in location {self.location}"
         )
 
         # Get infrastructure pid
@@ -858,8 +1074,11 @@ class CplnJob(Infrastructure):
         # Delete the cron workload
         await self._delete_workload(pid)
 
+        # Delete the reliant resources as well
+        self.cpln_k8s_converter.delete_reliant_resources()
+
         # Return infrastructure result with pid and status code
-        return CplnJobResult(identifier=pid, status_code=status_code)
+        return CplnInfrastructureResult(identifier=pid, status_code=status_code)
 
     async def kill(self, infrastructure_pid: str, grace_seconds: int = 30):
         """
@@ -870,7 +1089,12 @@ class CplnJob(Infrastructure):
             grace_seconds: The number of seconds to wait before killing the job.
         """
 
+        # Delete the workload
         await self._delete_workload(infrastructure_pid, grace_seconds)
+
+        # Delete the reliant resources if the converter is found
+        if self.cpln_k8s_converter:
+            self.cpln_k8s_converter.delete_reliant_resources()
 
     def preview(self):
         return yaml.dump(self._build_job())
@@ -896,7 +1120,7 @@ class CplnJob(Infrastructure):
             return self.config.get_api_client()
 
         # Create a new API client using the CPLN_TOKEN environment variable for authentication
-        return CplnConfig().get_api_client()
+        return CplnInfrastructureConfig().get_api_client()
 
     def _build_job(self) -> KubernetesObjectManifest:
         """Builds the Kubernetes Job Manifest"""
@@ -915,7 +1139,7 @@ class CplnJob(Infrastructure):
         reraise=True,
     )
     def _create_workload(
-        self, k8s_job: KubernetesObjectManifest, client: CplnClient
+        self, cpln_k8s_converter: CplnKubernetesConverter, client: CplnClient
     ) -> CplnObjectManifest:
         """
         Creates a Control Plane job from a Kubernetes job manifest.
@@ -934,7 +1158,10 @@ class CplnJob(Infrastructure):
         """
 
         # Convert the Kubernetes manifest to a Control Plane workload manifest
-        workload_manifest = CplnKubernetesConverter(self.namespace, k8s_job).convert()
+        workload_manifest = cpln_k8s_converter.convert()
+
+        # Create the reliant resources before creating the workload
+        cpln_k8s_converter.create_reliant_resources()
 
         # Extract the name of the workload from the manifest
         name = workload_manifest["name"]
@@ -1015,6 +1242,77 @@ class CplnJob(Infrastructure):
         # Set the job ID and exit the function
         return id
 
+    def _wait_until_ready(self, workload_name: str, client: CplnClient):
+        """
+        Wait until the created workload is ready.
+
+        This method repeatedly fetches data from the deployment URL of the workload,
+        checking if it is ready. If not ready, it waits before retrying, up to the
+        specified timeout in pod_watch_timeout_seconds.
+
+        Args:
+            workload_name (str): The workload name.
+            client (CplnClient): The Control Plane API client.
+
+        Raises:
+            TimeoutError: If the endpoint does not become ready within the timeout period.
+        """
+
+        # Record the start time to track how long the function has been running
+        start_time = time.time()
+
+        # Construct the workload link
+        workload_link = f"/org/{self.org}/gvc/{self.namespace}/workload/{workload_name}"
+
+        # Construct the workload deployments link
+        workload_deployments_link = f"{workload_link}/deployment"
+
+        # Start an infinite loop that will keep checking until the timeout is reached
+        while True:
+            # Fetch workload deployments
+            deployment_list = client.get(workload_deployments_link)
+
+            # Check if the response indicates readiness
+            if self._check_workload_readiness(deployment_list):
+                return
+
+            # Check if timeout has been exceeded
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= self.pod_watch_timeout_seconds:
+                raise InfrastructureError(
+                    f"Timeout exceeded while waiting for {workload_deployments_link} to become ready."
+                )
+
+            # Wait before the next attempt
+            time.sleep(RETRY_WORKLOAD_READY_CHECK_SECONDS)
+
+    def _check_workload_readiness(self, deployment_list) -> bool:
+        """
+        Check if the selected workload location is ready.
+
+        This method iterates over a list of deployments and checks whether the
+        deployment associated with the selected location is marked as ready.
+
+        Args:
+            deployment_list (dict): A dictionary containing deployment details,
+                                    where each deployment has a name and readiness status.
+
+        Returns:
+            bool: True if the selected location is ready, False otherwise.
+        """
+
+        # Iterate over each deployment and see if the current selected location is ready or not
+        for deployment in deployment_list["items"]:
+            # Skip any other location and look for the selected location
+            if deployment["name"] != self.location:
+                continue
+
+            # If we got here, then the location was found, return the value of the ready attribute
+            return deployment.get("status", {}).get("ready", False)
+
+        # If deployment was not found, return False
+        return False
+
     async def _watch_job(
         self,
         client: CplnClient,
@@ -1088,7 +1386,7 @@ class CplnJob(Infrastructure):
         if lifecycle_stage == "pending" or lifecycle_stage == "running":
             # Job is still running
             self.logger.error(
-                "An error occurred while waiting for the job to compelte - exiting...",
+                "An error occurred while waiting for the job to complete - exiting...",
                 exc_info=True,
             )
 
@@ -1147,6 +1445,11 @@ class CplnJob(Infrastructure):
 
         # Attempt to delete the job's cron workload.
         try:
+            # Notify of workload deletion
+            self.logger.info(
+                f"[CplnInfrastructure] Deleting workload '{workload_name}' in {grace_seconds} seconds."
+            )
+
             # Wait for the grace period before killing the job
             await asyncio.sleep(grace_seconds)
 
@@ -1271,7 +1574,7 @@ class CplnJob(Infrastructure):
                 {
                     "op": "add",
                     "path": "/metadata/generateName",
-                    "value": self._slugify_name(self.name) + "-",
+                    "value": self._slugify_name(self.name),
                 }
             )
         else:
@@ -1431,7 +1734,7 @@ async def watch_job_until_completion(
     interval_seconds: Optional[int] = None,
 ) -> str:
     """
-    Recusively fetch the command and check the lifecycle value for completion.
+    Recursively fetch the command and check the lifecycle value for completion.
 
     Args:
         client (CplnClient): The Control Plane API client.

@@ -232,9 +232,9 @@ class CplnClient:
         )
 
 
-class CplnConfig(Block):
+class CplnInfrastructureConfig(Block):
     """
-    Stores configuration for interaction with the Control Plane platform.
+    Stores infrastructure configuration for interaction with the Control Plane platform.
 
     Attributes:
         token: The Control Plane Service Account token of a specific organization.
@@ -242,9 +242,9 @@ class CplnConfig(Block):
     Example:
         Load a saved Control Plane config:
         ```python
-        from prefect_cpln.credentials import CplnConfig
+        from prefect.blocks.cpln import CplnInfrastructureConfig
 
-        cpln_config_block = CplnConfig.load("BLOCK_NAME")
+        cpln_infra_config_block = CplnInfrastructureConfig.load("BLOCK_NAME")
         ```
     """
 
@@ -255,7 +255,7 @@ class CplnConfig(Block):
     )
 
     ### Private Properties ###
-    _block_type_name = "Control Plane Configuration"
+    _block_type_name = "Control Plane Infrastructure Config"
     _logo_url = "https://console.cpln.io/resources/logos/controlPlaneLogoOnly.svg"
     _documentation_url = "https://docs.controlplane.com"  # noqa
 

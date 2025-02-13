@@ -9,9 +9,9 @@ from prefect.infrastructure.kubernetes import (
     KubernetesRestartPolicy,
 )
 from prefect.infrastructure.cpln import (
-    CplnConfig,
-    CplnJob,
-    CplnJobResult,
+    CplnInfrastructureConfig,
+    CplnInfrastructure,
+    CplnInfrastructureResult,
     CplnObjectManifest,
     KubernetesObjectManifest,
 )
@@ -19,10 +19,9 @@ from prefect.infrastructure.process import Process, ProcessResult
 
 # Declare API
 __all__ = [
-    "CplnConfig",
-    "CplnJob",
-    "CplnJob",
-    "CplnJobResult",
+    "CplnInfrastructureConfig",
+    "CplnInfrastructure",
+    "CplnInfrastructureResult",
     "CplnObjectManifest",
     "KubernetesObjectManifest",
     "DockerContainer",
