@@ -1757,14 +1757,14 @@
               "description": "The Control Plane config to use for job creation.",
               "allOf": [
                 {
-                  "$ref": "#/definitions/CplnConfig"
+                  "$ref": "#/definitions/ControlPlaneConfiguration"
                 }
               ]
             }
           },
           "definitions": {
-            "CplnConfig": {
-              "title": "CplnConfig",
+            "ControlPlaneConfiguration": {
+              "title": "Control Plane Configuration",
               "description": "Stores configuration for interaction with the Control Plane platform.",
               "type": "object",
               "properties": {
@@ -1774,7 +1774,7 @@
                   "type": "string"
                 }
               },
-              "block_type_slug": "cpln-config",
+              "block_type_slug": "control-plane-configuration",
               "secret_fields": [],
               "block_schema_references": {}
             }
