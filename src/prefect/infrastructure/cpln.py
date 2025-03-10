@@ -282,11 +282,9 @@ class CplnKubernetesConverter:
 
         # Define identity and policy links
         self._policy_parent_link = f"/org/{self._org}/policy"
-        self._policy_link = f"/org/{self._org}/policy/{self._policy_name}"
+        self._policy_link = f"{self._policy_parent_link}/{self._policy_name}"
         self._identity_parent_link = f"/org/{self._org}/gvc/{self._namespace}/identity"
-        self._identity_link = (
-            f"/org/{self._org}/gvc/{self._namespace}/identity/{self._identity_name}"
-        )
+        self._identity_link = f"{self._identity_parent_link}/{self._identity_name}"
 
         # Get identity and policy manifests
         self._policy = self._get_policy()
@@ -349,13 +347,16 @@ class CplnKubernetesConverter:
 
             # Set the identity link
             workload_spec[
-                "identity_link"
-            ] = f"//gvc/{self._namespace}/identity/{service_account_name}"
+                "identityLink"
+            ] = f"{self._identity_parent_link}/{service_account_name}"
         else:
             # Populate secret names and attach them to the policy
             for secret_name in self._secret_names:
                 # Update the policy manifest with a new secret link
                 self._policy["targetLinks"].append(f"//secret/{secret_name}")
+
+            # Set the default identity link
+            workload_spec["identityLink"] = self._identity_link
 
         # Return the Control Plane cron workload manifest
         return {
@@ -373,6 +374,10 @@ class CplnKubernetesConverter:
         and logs the creation of each resource.
         """
 
+        # Skip apply if identity is overridden
+        if self._is_identity_overridden:
+            return
+
         # Apply identity individually
         self._client.put(self._identity_parent_link, self._identity)
         self._logger.info(f"Created {self._identity_link}")
@@ -388,6 +393,10 @@ class CplnKubernetesConverter:
         This method removes the identity and policy by making delete requests to the client
         and logs the deletion of each resource.
         """
+
+        # Skip deletion if no identity/policy were created
+        if self._is_identity_overridden:
+            return
 
         # Delete identity individually
         self._client.delete(self._identity_link)
