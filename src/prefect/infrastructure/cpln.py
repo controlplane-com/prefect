@@ -166,41 +166,41 @@ class CplnLogsMonitor:
             for every log message received from the logs service.
         """
 
-        # Current time in milliseconds
-        now_millis = int(time.time() * 1000)
+        # Keep retrying to monitor logs until the job completes
+        while not self.completed:
+            try:
+                # Current time in milliseconds
+                now_millis = int(time.time() * 1000)
 
-        # Subtract the offset in milliseconds
-        offset_millis = JOB_WATCH_OFFSET_MINUTES * 60 * 1000
-        offset_time_millis = now_millis - offset_millis
+                # Subtract the offset in milliseconds
+                offset_millis = JOB_WATCH_OFFSET_MINUTES * 60 * 1000
+                offset_time_millis = now_millis - offset_millis
 
-        # Convert to nanoseconds
-        nanos = f"{offset_time_millis * 1_000_000}"
+                # Convert to nanoseconds
+                nanos = f"{offset_time_millis * 1_000_000}"
 
-        # Construct the query parameters
-        query_params = {
-            "query": f'{{gvc="{self._gvc}", location="{self._location}", workload="{self._workload_name}", replica=~"command-{self._command_id}.+"}}',
-            "start": nanos,
-            "direction": "forward",
-            "limit": 1000,
-        }
+                # Construct the query parameters
+                query_params = {
+                    "query": f'{{gvc="{self._gvc}", location="{self._location}", workload="{self._workload_name}", replica=~"command-{self._command_id}.+"}}',
+                    "start": nanos,
+                    "direction": "forward",
+                    "limit": 1000,
+                }
 
-        # Construct the WebSocket URL with the query parameters
-        url = f"{self.logs_url}/logs/org/{self._org}/loki/api/v1/tail?{urlencode(query_params)}"
+                # Construct the WebSocket URL with the query parameters
+                url = f"{self.logs_url}/logs/org/{self._org}/loki/api/v1/tail?{urlencode(query_params)}"
 
-        # Set the authorization token in the headers
-        headers = {"Authorization": self._client.token}
+                # Set the authorization token in the headers
+                headers = {"Authorization": self._client.token}
 
-        try:
-            # Connect to the WebSocket using the WebSocket URL and headers
-            async with websockets.connect(
-                url,
-                extra_headers=headers,
-                ping_interval=WEB_SOCKET_PING_INTERVAL_MS,
-            ) as websocket:
-                # Set the WebSocket connection
-                self._websocket = websocket
-
-                try:
+                # Connect to the WebSocket using the WebSocket URL and headers
+                async with websockets.connect(
+                    url,
+                    extra_headers=headers,
+                    ping_interval=WEB_SOCKET_PING_INTERVAL_MS,
+                ) as websocket:
+                    # Set the WebSocket connection
+                    self._websocket = websocket
                     # Continue receiving messages until the job completes
                     while not self.completed:
                         # Receive a message from the WebSocket
@@ -226,29 +226,15 @@ class CplnLogsMonitor:
                                 if print_func is not None:
                                     print_func(f"{timestamp} - {log_message}")
 
-                except websockets.ConnectionClosed as e:
-                    self._logger.info(f"Connection to logs service has closed: {e}")
+            except (websockets.ConnectionClosed, Exception) as e:
+                # Log an error message if an exception occurs while streaming logs
+                self._logger.info(f"Connection to logs server closed: {e}")
+                self._logger.warning(
+                    "Error occurred while streaming logs - will retry connection.",
+                    exc_info=True,
+                )
 
-        except Exception:
-            print(
-                "Error occurred while streaming logs - "
-                "Job will continue to run but logs will "
-                "no longer be streamed to stdout."
-            )
-
-            # Log an error message if an exception occurs while streaming logs
-            self._logger.warning(
-                (
-                    "Error occurred while streaming logs - "
-                    "Job will continue to run but logs will "
-                    "no longer be streamed to stdout."
-                ),
-                exc_info=True,
-            )
-
-            # Wait for the job to complete
-            while not self.completed:
-                # Pause for a second before checking the job completion again
+                # Brief pause before attempting to reconnect
                 await asyncio.sleep(1)
 
 
