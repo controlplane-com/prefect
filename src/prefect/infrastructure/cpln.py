@@ -303,7 +303,7 @@ class CplnKubernetesConverter:
             ),
             "job": self._build_cpln_workload_job_spec(pod_spec),
             "defaultOptions": {
-                "capacityAI": False,
+                "capacityAI": True,
                 "debug": False,
                 "suspend": True,  # Prefect will be the one triggering scheduled jobs, not us
             },
@@ -452,6 +452,8 @@ class CplnKubernetesConverter:
             "image": kubernetes_container["image"],
             "cpu": resources["cpu"],
             "memory": resources["memory"],
+            "minCpu": resources["minCpu"],
+            "minMemory": resources["minMemory"]
         }
 
         # Set command if specified
@@ -809,10 +811,24 @@ class CplnKubernetesConverter:
             if container["resources"]["limits"].get("memory"):
                 memory = container["resources"]["limits"]["memory"]
 
+        min_cpu, min_memory = cpu, memory
+
+        if container.get("resources", {}).get("requests"):
+            # Get the Min CPU limits
+            if container["resources"]["requests"].get("cpu"):
+                min_cpu = container["resources"]["requests"]["cpu"]
+
+            # Get the Min memory limits
+            if container["resources"]["requests"].get("memory"):
+                min_memory = container["resources"]["requests"]["memory"]
+
         # Return the resources
         return {
             "cpu": cpu,
             "memory": memory,
+            "minCpu": min_cpu,
+            "minMemory": min_memory
+
         }
 
 
