@@ -1275,7 +1275,8 @@ class CplnInfrastructure(Infrastructure):
             elapsed_time = time.time() - start_time
             if elapsed_time >= self.pod_watch_timeout_seconds:
                 raise InfrastructureError(
-                    f"Timeout exceeded while waiting for {workload_deployments_link} to become ready."
+                    f"Timeout of {self.pod_watch_timeout_seconds}s exceeded "
+                    f"while waiting for {workload_link} deployments at location '{self.location}' to become ready."
                 )
 
             # Wait before the next attempt
