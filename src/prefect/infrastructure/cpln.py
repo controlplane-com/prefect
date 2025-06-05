@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
@@ -45,6 +45,7 @@ else:
 COMMAND_STATUS_CHECK_DELAY: int = 5
 JOB_WATCH_OFFSET_MINUTES: int = 5
 LIFECYCLE_FINAL_STAGES: List[str] = ["completed", "failed", "cancelled"]
+ORPHAN_TTL_HOURS: int = 24  # To determine whether a workload is orphaned or not
 
 # Retry Related
 RETRY_MAX_ATTEMPTS = 3
@@ -52,6 +53,18 @@ RETRY_MIN_DELAY_SECONDS = 1
 RETRY_MIN_DELAY_JITTER_SECONDS = 0
 RETRY_MAX_DELAY_JITTER_SECONDS = 3
 RETRY_WORKLOAD_READY_CHECK_SECONDS = 2
+
+# Tags Related
+PREFECT_IDENTIFIER_TAG_KEY = "cpln/createdByPrefect"
+CPLN_WORKLOAD_SPEC_HASH_TAG_KEY = "cpln/specHash"
+
+# Workload Related
+DEFAULT_CONTAINER_NAME = "prefect-job"
+DEFAULT_CONTAINER_IMAGE = "ubuntu:latest"
+DEFAULT_CONTAINER_RESOURCES = {
+    "cpu": "25m",
+    "memory": "32Mi",
+}
 
 # API Request Configuration
 HTTP_REQUEST_TIMEOUT: int = 60
@@ -257,7 +270,7 @@ class CplnKubernetesConverter:
         self._k8s_job = k8s_job
 
         # Converter related
-        self._is_identity_overridden = False
+        self.is_identity_overridden = False
 
         # Extract job name from the manifest
         self._k8s_job_name = k8s_job["metadata"]["generateName"]
@@ -305,7 +318,7 @@ class CplnKubernetesConverter:
             "defaultOptions": {
                 "capacityAI": False,
                 "debug": False,
-                "suspend": True,  # Prefect will be the one triggering scheduled jobs, not us
+                "suspend": True,  # Prefect will be the one triggering scheduled jobs, not the control plane platform
             },
             "firewallConfig": {
                 "external": {
@@ -326,7 +339,7 @@ class CplnKubernetesConverter:
         # Set identity link and override default identity
         if pod_spec.get("serviceAccountName"):
             # Indicate that the default identity has been overridden
-            self._is_identity_overridden = True
+            self.is_identity_overridden = True
 
             # Extract the service account name
             service_account_name = pod_spec["serviceAccountName"]
@@ -348,9 +361,49 @@ class CplnKubernetesConverter:
         return {
             "kind": "workload",
             "name": self._k8s_job_name,
-            "tags": self._k8s_job["metadata"]["labels"],
+            "tags": {},
             "spec": workload_spec,
         }
+
+    def build_container_overrides(self):
+        """Builds container overrides for cron workload job."""
+
+        # Get the pod spec from the job
+        kubernetes_container: dict = self._k8s_job["spec"]["template"]["spec"][
+            "containers"
+        ][0]
+
+        # Get container resources
+        resources = self._convert_kubernetes_job_resources(kubernetes_container)
+
+        # Initialize the container override
+        containerOverride = {
+            "name": DEFAULT_CONTAINER_NAME,
+            "image": kubernetes_container["image"],
+            "cpu": resources["cpu"],
+            "memory": resources["memory"],
+        }
+
+        # Set command if specified
+        if kubernetes_container.get("command"):
+            containerOverride["command"] = " ".join(kubernetes_container["command"])
+
+        # Set args if specified
+        if kubernetes_container.get("args"):
+            containerOverride["args"] = kubernetes_container["args"]
+
+        # Set environment variables
+        if kubernetes_container.get("env"):
+            containerOverride["env"] = kubernetes_container["env"]
+
+        # Process envFrom attribute and merge it with container env
+        if kubernetes_container.get("envFrom"):
+            containerOverride["env"] += self._process_env_from(
+                kubernetes_container["envFrom"]
+            )
+
+        # Return an array that includes the container override
+        return [containerOverride]
 
     def create_reliant_resources(self):
         """
@@ -361,7 +414,7 @@ class CplnKubernetesConverter:
         """
 
         # Skip apply if identity is overridden
-        if self._is_identity_overridden:
+        if self.is_identity_overridden:
             return
 
         # Apply identity individually
@@ -381,7 +434,7 @@ class CplnKubernetesConverter:
         """
 
         # Skip deletion if no identity/policy were created
-        if self._is_identity_overridden:
+        if self.is_identity_overridden:
             return
 
         # Delete identity individually
@@ -443,36 +496,17 @@ class CplnKubernetesConverter:
             list: The Control Plane cron workload containers.
         """
 
-        # Get container resources
-        resources = self._convert_kubernetes_job_resources(kubernetes_container)
-
         # Build workload container
         container = {
-            "name": kubernetes_container["name"],
-            "image": kubernetes_container["image"],
-            "cpu": resources["cpu"],
-            "memory": resources["memory"],
+            "name": DEFAULT_CONTAINER_NAME,
+            "image": DEFAULT_CONTAINER_IMAGE,
+            "cpu": DEFAULT_CONTAINER_RESOURCES["cpu"],
+            "memory": DEFAULT_CONTAINER_RESOURCES["memory"],
         }
-
-        # Set command if specified
-        if kubernetes_container.get("command"):
-            container["command"] = " ".join(kubernetes_container["command"])
-
-        # Set args if specified
-        if kubernetes_container.get("args"):
-            container["args"] = kubernetes_container["args"]
 
         # Set working directory
         if kubernetes_container.get("workingDir"):
             container["workingDir"] = kubernetes_container["workingDir"]
-
-        # Set environment variables
-        if kubernetes_container.get("env"):
-            container["env"] = kubernetes_container["env"]
-
-        # Process envFrom attribute and merge it with container env
-        if kubernetes_container.get("envFrom"):
-            container["env"] += self._process_env_from(kubernetes_container["envFrom"])
 
         # Set volume mounts
         if kubernetes_container.get("volumeMounts"):
@@ -1032,10 +1066,15 @@ class CplnInfrastructure(Infrastructure):
         )
 
         # Create the cron workload
-        workload = self._create_workload(self.cpln_k8s_converter, client)
+        workload = self._find_or_create_workload(client)
 
         # Extract the job name from the job manifest
         workload_name = workload["name"]
+
+        # Construct the self link of the workload
+        workload_self_link: str = (
+            f"/org/{self.org}/gvc/{self.namespace}/workload/{workload_name}"
+        )
 
         # Log a message to indicate that we are waiting for workload readiness
         self.logger.info(
@@ -1049,15 +1088,15 @@ class CplnInfrastructure(Infrastructure):
         self.logger.info("Workload is ready!")
 
         # Start the job
-        job_id = self._start_job(client, workload)
+        job_id = self._start_job(client, workload, k8s_job)
 
         # Log the successful start of the job and the job ID
         self.logger.info(
-            f"[CplnInfrastructure] Started job with ID: {job_id} in location {self.location}"
+            f"[CplnInfrastructure] Started job with ID: {job_id} in location {self.location} in workload {workload_self_link}"
         )
 
         # Get infrastructure pid
-        pid = self._get_infrastructure_pid(workload)
+        pid = self._get_infrastructure_pid(workload, job_id)
 
         # Indicate that the job has started
         if task_status is not None:
@@ -1066,11 +1105,13 @@ class CplnInfrastructure(Infrastructure):
         # Monitor the job until completion
         status_code = await self._watch_job(client, workload_name, job_id)
 
-        # Delete the cron workload
-        await self._delete_workload(pid)
-
-        # Delete the reliant resources as well
-        self.cpln_k8s_converter.delete_reliant_resources()
+        # Cleanup orphaned workloads
+        try:
+            self._cleanup_orphaned_workloads(client)
+        except requests.exceptions.HTTPError as e:
+            self.logger.warning(
+                f"[CplnInfrastructure] An error occurred during cleanup: f{e.response.text}"
+            )
 
         # Return infrastructure result with pid and status code
         return CplnInfrastructureResult(identifier=pid, status_code=status_code)
@@ -1084,12 +1125,27 @@ class CplnInfrastructure(Infrastructure):
             grace_seconds: The number of seconds to wait before killing the job.
         """
 
-        # Delete the workload
-        await self._delete_workload(infrastructure_pid, grace_seconds)
+        # Retrieve the API client to interact with the Control Plane platform
+        client: CplnClient = self._get_cpln_client()
 
-        # Delete the reliant resources if the converter is found
-        if self.cpln_k8s_converter:
-            self.cpln_k8s_converter.delete_reliant_resources()
+        # Parse the infrastructure PID to extract the organization ID, namespace, workload name, and job id
+        (
+            job_org_name,
+            job_namespace,
+            job_workload_name,
+            job_id,
+        ) = self._parse_infrastructure_pid(infrastructure_pid)
+
+        # Construct the self link of the workload
+        workload_self_link = (
+            f"/org/{job_org_name}/gvc/{job_namespace}/workload/{job_workload_name}"
+        )
+
+        # Wait for the grace period before killing the job
+        await asyncio.sleep(grace_seconds)
+
+        # Stop the job from running
+        self._stop_job(client, workload_self_link, job_id)
 
     def preview(self):
         return yaml.dump(self._build_job())
@@ -1124,6 +1180,23 @@ class CplnInfrastructure(Infrastructure):
         job_manifest = self.customizations.apply(job_manifest)
         return job_manifest
 
+    def _spec_hash(self, spec: dict) -> str:
+        """Deterministically hash the parts of the manifest that define workload identity."""
+        return stable_hash(json.dumps(spec, sort_keys=True))
+
+    def _tag_prefect_workload(self, manifest: dict, spec_hash: str):
+        """Attach Control Plane tracking tags to a Prefect workload manifest."""
+        # Guarantee that the manifest has a tags dictionary to hold metadata
+        manifest.setdefault("tags", {})
+
+        # Add or update tags indicating the manifest was generated by Prefect
+        manifest["tags"].update(
+            {
+                f"{PREFECT_IDENTIFIER_TAG_KEY}": "true",
+                f"{CPLN_WORKLOAD_SPEC_HASH_TAG_KEY}": spec_hash,
+            }
+        )
+
     @retry(
         stop=stop_after_attempt(RETRY_MAX_ATTEMPTS),
         wait=wait_fixed(RETRY_MIN_DELAY_SECONDS)
@@ -1133,9 +1206,7 @@ class CplnInfrastructure(Infrastructure):
         ),
         reraise=True,
     )
-    def _create_workload(
-        self, cpln_k8s_converter: CplnKubernetesConverter, client: CplnClient
-    ) -> CplnObjectManifest:
+    def _find_or_create_workload(self, client: CplnClient) -> CplnObjectManifest:
         """
         Creates a Control Plane job from a Kubernetes job manifest.
 
@@ -1153,29 +1224,91 @@ class CplnInfrastructure(Infrastructure):
         """
 
         # Convert the Kubernetes manifest to a Control Plane workload manifest
-        workload_manifest = cpln_k8s_converter.convert()
+        workload_manifest = self.cpln_k8s_converter.convert()
+
+        # Build a copy of "spec" for hashing—but drop identityLink if no serviceAccountName was set
+        spec_for_hash: dict = copy.deepcopy(workload_manifest["spec"])
+        if not self.cpln_k8s_converter.is_identity_overridden:
+            spec_for_hash.pop("identityLink", None)
+
+        # Calculate unique hash for the workload specification
+        spec_hash = self._spec_hash(spec_for_hash)
+
+        # Attempt to find a workload with matching hash
+        try:
+            # Construct the query object
+            query = {
+                "spec": {
+                    "match": "all",
+                    "terms": [
+                        {"op": "=", "rel": "gvc", "value": self.namespace},
+                        {
+                            "op": "=",
+                            "tag": f"{PREFECT_IDENTIFIER_TAG_KEY}",
+                            "value": "true",
+                        },
+                        {
+                            "op": "=",
+                            "tag": f"{CPLN_WORKLOAD_SPEC_HASH_TAG_KEY}",
+                            "value": spec_hash,
+                        },
+                    ],
+                }
+            }
+
+            # Make the POST request to query the workloads
+            query_result_response = client.post(
+                f"/org/{self.org}/workload/-query", query
+            )
+
+            # Convert the response into a dict
+            query_result = query_result_response.json()
+
+            # If there is at least one workload that is found, return it, that is our result
+            if len(query_result.get("items", [])) > 0:
+                # Extract the very first item as the workload that is found
+                found_workload: CplnObjectManifest = query_result["items"][0]
+
+                # Extract the self link of the workload
+                workload_self_link: str = self._extract_self_link(found_workload)
+
+                # Log that we have found a workload and we will be using it instead creating a new one
+                self.logger.info(
+                    f"{workload_self_link} has been found and will be used for running the job."
+                )
+
+                # Return the found workload
+                return found_workload
+
+        except requests.exceptions.HTTPError as e:
+            raise InfrastructureError(
+                f"Failed to query workloads: {str(e.response.text)}"
+            ) from e
+
+        # Apply Prefect tracking tags to the workload manifest using the hash
+        self._tag_prefect_workload(workload_manifest, spec_hash)
 
         # Create the reliant resources before creating the workload
-        cpln_k8s_converter.create_reliant_resources()
+        self.cpln_k8s_converter.create_reliant_resources()
 
         # Extract the name of the workload from the manifest
         name = workload_manifest["name"]
 
+        # Construct workload home link
+        workload_home_link = f"/org/{self.org}/gvc/{self.namespace}/workload"
+
+        # Construct workload self link
+        workload_self_link = f"{workload_home_link}/{name}"
+
         try:
             # Attempt to retrieve the workload by its name if it already exists
-            client.get(
-                f"/org/{self.org}/gvc/{self.namespace}/workload/{name}",
-                True,
-            )
+            client.get(workload_self_link, True)
 
             # If no exception has been thrown, then update the workload with the new manifest
-            client.put(
-                f"/org/{self.org}/gvc/{self.namespace}/workload/",
-                workload_manifest,
-            )
+            client.put(workload_home_link, workload_manifest)
 
             # Return the updated workload
-            return client.get(f"/org/{self.org}/gvc/{self.namespace}/workload/{name}")
+            return client.get(workload_self_link)
 
         except requests.exceptions.HTTPError as e:
             # If the workload doesn't exist, raise an error if the status code is not 404
@@ -1186,18 +1319,19 @@ class CplnInfrastructure(Infrastructure):
 
         # If workload doesn't exist, create a new one
         client.post(
-            f"/org/{self.org}/gvc/{self.namespace}/workload",
+            workload_home_link,
             workload_manifest,
             timeout=self.pod_watch_timeout_seconds,
         )
 
         # Retrieve and return the newly created workload for confirmation
-        return client.get(f"/org/{self.org}/gvc/{self.namespace}/workload/{name}")
+        return client.get(workload_self_link)
 
     def _start_job(
         self,
         client: CplnClient,
         manifest: CplnObjectManifest,
+        k8s_job: KubernetesObjectManifest,
     ):
         """
         Starts a new job in the specified location and workload.
@@ -1221,7 +1355,11 @@ class CplnInfrastructure(Infrastructure):
         # Construct the command to start a new job
         command = {
             "type": "runCronWorkload",
-            "spec": {"location": self.location, "containerOverrides": []},
+            "tags": k8s_job["metadata"]["labels"],
+            "spec": {
+                "location": self.location,
+                "containerOverrides": self.cpln_k8s_converter.build_container_overrides(),
+            },
         }
 
         # Make a POST request to start a new job in the specified location and workload
@@ -1236,6 +1374,71 @@ class CplnInfrastructure(Infrastructure):
 
         # Set the job ID and exit the function
         return id
+
+    def _stop_job(self, client: CplnClient, workload_self_link: str, command_id: str):
+        """
+        Stop a running job in the specified location and workload.
+
+        Args:
+            client (CplnClient): The API client used to communicate with the Control Plane.
+            workload_self_link: The self link to the workload.
+            command_id: The identifier for the job that is running.
+        """
+
+        # Attempt to find a workload with matching hash
+        try:
+            # Fetch deployments for the specified cron workload
+            deployment_list = client.get(f"{workload_self_link}/deployment")
+
+            # Extract the items array from the deployment list
+            deployments = deployment_list.get("items", [])
+
+            # If there were no deployments, then basically there is no job to stop
+            if len(deployments) == 0:
+                return
+
+            # Iterate over each deployment and attempt to find the job within job executions
+            for deployment in deployments:
+                # If there are no job executions, skip deployment
+                if not deployment.get("jobExecutions", {}):
+                    continue
+
+                # Declare a variable to indicate if the specified job is found
+                is_found = False
+
+                # Iterate over each job execution and attempt to find the job to stop
+                for job in deployment["jobExecutions"]:
+                    # Check if the name of the job includes the command id, and skip if not
+                    if command_id not in job.get("name", ""):
+                        continue
+
+                    # Mark that the job has been found
+                    is_found = True
+
+                    # Skip if the job has no replicas, because if there isn't, then that simply means that there was no replica in the first place
+                    if "replica" not in job:
+                        break
+
+                    # Construct the query object
+                    body = {
+                        "type": "stopReplica",
+                        "spec": {
+                            "replica": job["replica"],
+                            "location": self.location,
+                        },
+                    }
+
+                    # Make the POST request to query the workloads
+                    client.post(f"{workload_self_link}/-command", body)
+
+                # If the job has been found, stop looping
+                if is_found:
+                    break
+
+        except requests.exceptions.HTTPError as e:
+            raise InfrastructureError(
+                f"Failed to stop job {command_id}: {str(e.response.text)}"
+            ) from e
 
     def _wait_until_ready(self, workload_name: str, client: CplnClient):
         """
@@ -1419,7 +1622,7 @@ class CplnInfrastructure(Infrastructure):
         client: CplnClient = self._get_cpln_client()
 
         # Parse the infrastructure PID to extract the organization ID, namespace, and job name
-        job_org_name, job_namespace, workload_name = self._parse_infrastructure_pid(
+        job_org_name, job_namespace, workload_name, _ = self._parse_infrastructure_pid(
             infrastructure_pid
         )
 
@@ -1463,7 +1666,7 @@ class CplnInfrastructure(Infrastructure):
                 # Raise the original exception if the error is not due to the job not being found
                 raise
 
-    def _get_infrastructure_pid(self, workload: CplnObjectManifest) -> str:
+    def _get_infrastructure_pid(self, workload: CplnObjectManifest, job_id: str) -> str:
         """
         Generates a Control Plane infrastructure PID.
         The PID is in the format: "<org uid>:<namespace>:<job name>".
@@ -1482,11 +1685,11 @@ class CplnInfrastructure(Infrastructure):
         workload_name = workload["name"]
 
         # Construct the infrastructure PID and return it
-        return f"{self.org}:{self.namespace}:{workload_name}"
+        return f"{self.org}:{self.namespace}:{workload_name}:{job_id}"
 
     def _parse_infrastructure_pid(
         self, infrastructure_pid: str
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str, str, str]:
         """
         Parse a Control Plane infrastructure PID into its component parts.
 
@@ -1498,10 +1701,12 @@ class CplnInfrastructure(Infrastructure):
         """
 
         # Split the infrastructure PID into its component parts
-        org_name, namespace, workload_name = infrastructure_pid.split(":", 2)
+        org_name, namespace, workload_name, command_id = infrastructure_pid.split(
+            ":", 3
+        )
 
         # Return the organization ID, namespace, and job name
-        return org_name, namespace, workload_name
+        return org_name, namespace, workload_name, command_id
 
     def _shortcut_customizations(self) -> JsonPatch:
         """Produces the JSON 6902 patch for the most commonly used customizations, like
@@ -1716,6 +1921,174 @@ class CplnInfrastructure(Infrastructure):
 
         # Drop null values allowing users to "unset" variables
         return {key: value for key, value in env.items() if value is not None}
+
+    def _cleanup_orphaned_workloads(self, client: CplnClient):
+        """
+        Clean up workloads in the organization that were created by Prefect but have become orphaned.
+
+        This method constructs a query to retrieve all workloads tagged with "PREFECT_IDENTIFIER_TAG_KEY",
+        then iterates through each workload. For each workload, it extracts the self link URL and
+        checks if the workload is orphaned by calling _is_workload_orphaned. If the workload is
+        determined to be orphaned, it is deleted via the client.
+
+        Parameters:
+            client (CplnClient): The API client used to communicate with the Control Plane.
+
+        Returns:
+            None
+        """
+
+        # Construct the query object
+        query = {
+            "spec": {
+                "match": "all",
+                "terms": [
+                    {"op": "=", "tag": f"{PREFECT_IDENTIFIER_TAG_KEY}", "value": "true"}
+                ],
+            }
+        }
+
+        # Fetch the workloads that have the PREFECT_IDENTIFIER_TAG_KEY tag
+        query_result_response = client.post(f"/org/{self.org}/workload/-query", query)
+
+        # Convert the response into a dict
+        query_result = query_result_response.json()
+
+        # Iterate over the items and delete orphaned workloads
+        for workload in query_result.get("items", []):
+            # Extract workload name
+            workload_name = workload["name"]
+
+            # Extract the self link of the workload
+            workload_self_link = self._extract_self_link(workload)
+
+            # Extract the GVC name from the workload self link
+            gvc_name = self._extract_gvc(workload_self_link)
+
+            # If a workload is orphaned delete it
+            if workload_self_link and self._is_workload_orphaned(
+                client, workload_self_link
+            ):
+                # Log workload deletion
+                self.logger.info(
+                    f"[CplnInfrastructure] Deleting workload '{workload_self_link}' because it is orphaned."
+                )
+
+                # Delete the workload as it is orphaned
+                client.delete(workload_self_link)
+
+                # Construct the links for the workload reliant resources
+                links = [
+                    f"/org/{self.org}/policy/{workload_name}-reveal-policy",
+                    f"/org/{self.org}/gvc/{gvc_name}/identity/{workload_name}-identity",
+                ]
+
+                # Iteratae over the links of the reliant resources and delete them
+                for link in links:
+                    # Notify that we are about to delete a resource
+                    self.logger.info(f"[CplnInfrastructure] Deleting {link}")
+
+                    # Delete the resources
+                    client.delete(link)
+
+    def _is_workload_orphaned(self, client: CplnClient, workload_self_link: str):
+        """
+        Determine whether a given workload has no recent active deployments.
+
+        This method fetches all deployments associated with the specified workload via its self link.
+        It then finds the most recent "lastModified" timestamp among those deployments (if any exist).
+        If no deployments contain a "lastModified" field, the workload is considered new and not orphaned.
+        Otherwise, it compares the most recent timestamp against the current UTC time and
+        returns True if the elapsed time exceeds ORPHAN_TTL_HOURS.
+
+        Parameters:
+            client (CplnClient): The API client used to fetch deployment information.
+            workload_self_link (str): The self link URL of the workload to inspect.
+
+        Returns:
+            bool: True if the workload is orphaned (no deployments updated within the TTL), False otherwise.
+        """
+
+        # Fetch the deployments for the specified cron workload
+        deployment_list = client.get(f"{workload_self_link}/deployment")
+
+        # Declare the variable to hold the most recent last modified
+        most_recent: datetime | None = None
+
+        # Loop through each deployment in the fetched deployment list
+        for deployment in deployment_list.get("items", []):
+            # Within each deployment, iterate over jobExecutions under its status
+            for job_exec in deployment.get("status", {}).get("jobExecutions", []):
+                # Use completionTime if available, otherwise fall back to startTime
+                ts_str = job_exec.get("completionTime") or job_exec.get("startTime")
+
+                # If no timestamp is present, skip this job execution
+                if not ts_str:
+                    continue
+
+                # Convert the ISO timestamp string to a UTC datetime object
+                exec_time = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+                # Update most_recent if it is None or if this execution is newer
+                if not most_recent or exec_time > most_recent:
+                    most_recent = exec_time
+
+        # If no deployment has a last modified, then maybe it is a recent workload
+        if not most_recent:
+            return False
+
+        # Get the current UTC time
+        now_utc = datetime.now(timezone.utc)
+
+        # Calculate how many seconds have passed since the most recent execution
+        time_difference_in_seconds = (now_utc - most_recent).total_seconds()
+
+        # Return True if the elapsed time exceeds the defined TTL (in hours converted to seconds)
+        return time_difference_in_seconds > ORPHAN_TTL_HOURS * 3600
+
+    def _extract_self_link(self, manifest: CplnObjectManifest):
+        """
+        Extract the self-referential link (href) from a workload manifest.
+
+        This method checks the manifest for a "links" section. If present, it iterates through each link
+        object and returns the href value where the "rel" field equals "self". If no such link is found,
+        or if the manifest has no "links" section, it returns None.
+
+        Parameters:
+            manifest (CplnObjectManifest): The JSON-like manifest dictionary of a Control Plane object.
+
+        Returns:
+            str | None: The href string of the self link, or None if not found.
+        """
+
+        # Skip if links is not specified in the manifest
+        if "links" not in manifest:
+            return None
+
+        # Iterate over links and attempt to find the self relation and return its href
+        for link in manifest["links"]:
+            # Skip if link relation is not "self"
+            if link.get("rel", "") != "self":
+                continue
+
+            # If relation self is found, return its href
+            return link["href"]
+
+        # If self relation was never found, return None
+        return None
+
+    def _extract_gvc(self, self_link):
+        """Extracts and returns the GVC name from a self-link of a GVC scoped object."""
+
+        # Return None if self_link is None as well
+        if not self_link:
+            return None
+
+        # Split the self link into parts
+        parts = self_link.split("/")
+
+        # parts == ["", "org", "org-name", "gvc", "gvc-name-here", "workload", "workload-name"]
+        return parts[4]
 
 
 ### Helper Functions ###
