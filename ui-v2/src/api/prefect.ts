@@ -7284,6 +7284,20 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** FlowRunResult */
+        FlowRunResult: {
+            /**
+             * Input Type
+             * @default flow_run
+             * @constant
+             */
+            input_type: "flow_run";
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+        };
         /**
          * FlowRunSort
          * @description Defines flow run sorting options.
@@ -8602,7 +8616,7 @@ export interface components {
              * @description Tracks the source of inputs to a task run. Used for internal bookkeeping.
              */
             task_inputs?: {
-                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
+                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["FlowRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
             };
             /** @description The type of the current task run state. */
             state_type?: components["schemas"]["StateType"] | null;
@@ -8729,7 +8743,7 @@ export interface components {
              * @description The inputs to the task run.
              */
             task_inputs?: {
-                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
+                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["FlowRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
             };
         };
         /**
@@ -9012,7 +9026,7 @@ export interface components {
              * @description Inputs provided to the task run.
              */
             task_inputs?: {
-                [key: string]: components["schemas"]["TaskRunResult"][];
+                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["FlowRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
             };
             /**
              * Context
@@ -9151,7 +9165,7 @@ export interface components {
              * @description Tracks the source of inputs to a task run. Used for internal bookkeeping.
              */
             task_inputs?: {
-                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
+                [key: string]: (components["schemas"]["TaskRunResult"] | components["schemas"]["FlowRunResult"] | components["schemas"]["Parameter"] | components["schemas"]["Constant"])[];
             };
             /** @description The type of the current task run state. */
             state_type?: components["schemas"]["StateType"] | null;
