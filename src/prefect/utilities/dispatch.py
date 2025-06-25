@@ -22,9 +22,11 @@ lookup_type(Base, key) # Foo
 
 import abc
 import inspect
+import logging
 import warnings
 from typing import Any, Dict, Optional, Type, TypeVar
 
+logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=Type)
 
 _TYPE_REGISTRIES: Dict[Type, Dict[str, Type]] = {}
@@ -176,16 +178,44 @@ def lookup_type(cls: T, dispatch_key: str) -> T:
     """
     Look up a dispatch key in the type registry for the given class.
     """
+    # Log the incoming class and key
+    logger.debug(
+        "[lookup_type]: lookup_type called: cls=%r, dispatch_key=%r", cls, dispatch_key
+    )
+
     # Get the first matching registry for the class or one of its bases
     registry = get_registry_for_type(cls)
+    logger.debug("[lookup_type]: registry for %r -> %r", cls, registry)
+
+    # If no registry exists, report known base types and abort
+    if registry is None:
+        known_bases = ", ".join(b.__name__ for b in _TYPE_REGISTRIES)
+        logger.error(
+            "[lookup_type]: No registry found for %r. Known base types: %s",
+            cls,
+            known_bases,
+        )
+        raise KeyError(
+            f"No class found for dispatch key {dispatch_key!r} "
+            f"in registry for type {cls.__name__!r}."
+        )
 
     # Look up this type in the registry
     subcls = registry.get(dispatch_key)
 
     if subcls is None:
+        available = ", ".join(registry.keys())
+        logger.error(
+            "[lookup_type]: Dispatch key %r not in registry for %r. Available keys: %s",
+            dispatch_key,
+            cls,
+            available,
+        )
         raise KeyError(
-            f"No class found for dispatch key {dispatch_key!r} in registry for type "
-            f"{cls.__name__!r}."
+            f"No class found for dispatch key {dispatch_key!r} "
+            f"in registry for type {cls.__name__!r}."
         )
 
+    # Successful lookup—log the resulting subclass
+    logger.debug("[lookup_type]: found subclass %r for key %r", subcls, dispatch_key)
     return subcls
