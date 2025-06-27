@@ -83,6 +83,53 @@ KubernetesObjectManifest = Dict[str, Any]
 ### Classes ###
 
 
+class MetadataAdapter(logging.LoggerAdapter):
+    """
+    LoggerAdapter that injects Kubernetes flow-run metadata into each log message.
+    """
+
+    def __init__(self, logger, extra=None):
+        super().__init__(
+            logger,
+            extra
+            or {
+                "k8s_labels": {},
+                "workload_name": None,
+                "command_id": None,
+            },
+        )
+
+    def process(self, msg, kwargs):
+        # Retrieve the job labels
+        labels = self.extra["k8s_labels"]
+
+        # Initialize metadata string
+        meta = ""
+
+        # Add flow name to metadata if available
+        if labels.get("prefect.io/flow-name"):
+            meta += f", Flow Name: {labels['prefect.io/flow-name']}"
+
+        # Add flow run ID to metadata if available
+        if labels.get("prefect.io/flow-run-id"):
+            meta += f", Flow Run ID: {labels['prefect.io/flow-run-id']}"
+
+        # Add flow run name to metadata if available
+        if labels.get("prefect.io/flow-run-name"):
+            meta += f", Flow Run Name: {labels['prefect.io/flow-run-name']}"
+
+        # Add workload name to metadata if provided
+        if self.extra.get("workload_name"):
+            meta += f", Workload Name: {self.extra['workload_name']}"
+
+        # Add command ID to metadata if provided
+        if self.extra.get("command_id"):
+            meta += f", Command ID: {self.extra['command_id']}"
+
+        # Prefix the message with metadata and return
+        return f"[CplnInfrastructure{meta}] {msg}", kwargs
+
+
 class CplnLogsMonitor:
     """Allows you to monitor logs of a running job."""
 
@@ -883,6 +930,7 @@ class CplnInfrastructure(Infrastructure):
     _logo_url = "https://console.cpln.io/resources/logos/controlPlaneLogoOnly.svg"
     _documentation_url = "https://docs.controlplane.com"
     _api_dns_name: Optional[str] = None  # Replaces 'localhost' in API URL
+    _custom_logger: MetadataAdapter
 
     type: Literal["cpln-infrastructure"] = Field(
         default="cpln-infrastructure", description="The type of infrastructure."
@@ -1053,16 +1101,25 @@ class CplnInfrastructure(Infrastructure):
 
         # Build the Kubernetes job manifest
         k8s_job = self._build_job()
+        k8s_job_metadata_labels = k8s_job["metadata"]["labels"]
+
+        # Use the metadata logger adapter for logging
+        self._custom_logger = MetadataAdapter(
+            self.logger,
+            {
+                "k8s_labels": k8s_job_metadata_labels,
+            },
+        )
 
         # Get the client from the configuration
         client = self._get_cpln_client()
 
         # Log a message to indicate that the job is being created
-        self.logger.info("Creating Control Plane job...")
+        self._custom_logger.info("Creating Control Plane job...")
 
         # Initialize the Control Plane Kubernetes converter
         self.cpln_k8s_converter = CplnKubernetesConverter(
-            self.logger, client, self.org, self.namespace, k8s_job
+            self._custom_logger, client, self.org, self.namespace, k8s_job
         )
 
         # Create the cron workload
@@ -1070,6 +1127,7 @@ class CplnInfrastructure(Infrastructure):
 
         # Extract the job name from the job manifest
         workload_name = workload["name"]
+        self._custom_logger.extra["workload_name"] = workload_name
 
         # Construct the self link of the workload
         workload_self_link: str = (
@@ -1077,7 +1135,7 @@ class CplnInfrastructure(Infrastructure):
         )
 
         # Log a message to indicate that we are waiting for workload readiness
-        self.logger.info(
+        self._custom_logger.info(
             f"Waiting for the cron workload '{workload_name}' to become ready..."
         )
 
@@ -1085,14 +1143,15 @@ class CplnInfrastructure(Infrastructure):
         self._wait_until_ready(workload_name, client)
 
         # Log a message to indicate that workload is ready
-        self.logger.info("Workload is ready!")
+        self._custom_logger.info("Workload is ready!")
 
         # Start the job
         job_id = self._start_job(client, workload, k8s_job)
+        self._custom_logger.extra["command_id"] = job_id
 
         # Log the successful start of the job and the job ID
-        self.logger.info(
-            f"[CplnInfrastructure] Started job with ID: {job_id} in location {self.location} in workload {workload_self_link}"
+        self._custom_logger.info(
+            f"Started job with ID: {job_id} in location {self.location} in workload {workload_self_link}"
         )
 
         # Get infrastructure pid
@@ -1109,8 +1168,8 @@ class CplnInfrastructure(Infrastructure):
         try:
             self._cleanup_orphaned_workloads(client)
         except requests.exceptions.HTTPError as e:
-            self.logger.warning(
-                f"[CplnInfrastructure] An error occurred during cleanup: f{e.response.text}"
+            self._custom_logger.warning(
+                f"An error occurred during cleanup: f{e.response.text}"
             )
 
         # Return infrastructure result with pid and status code
@@ -1140,6 +1199,13 @@ class CplnInfrastructure(Infrastructure):
         workload_self_link = (
             f"/org/{job_org_name}/gvc/{job_namespace}/workload/{job_workload_name}"
         )
+
+        # Use the metadata logger adapter for logging
+        self._custom_logger = MetadataAdapter(self.logger)
+
+        # Set necessary metadata for the upcoming logging
+        self._custom_logger.extra["workload_name"] = job_workload_name
+        self._custom_logger.extra["command_id"] = job_workload_name
 
         # Wait for the grace period before killing the job
         await asyncio.sleep(grace_seconds)
@@ -1273,7 +1339,7 @@ class CplnInfrastructure(Infrastructure):
                 workload_self_link: str = self._extract_self_link(found_workload)
 
                 # Log that we have found a workload and we will be using it instead creating a new one
-                self.logger.info(
+                self._custom_logger.info(
                     f"{workload_self_link} has been found and will be used for running the job."
                 )
 
@@ -1281,6 +1347,9 @@ class CplnInfrastructure(Infrastructure):
                 return found_workload
 
         except requests.exceptions.HTTPError as e:
+            self._custom_logger.error(
+                f"Failed to query workloads: {str(e.response.text)}", exc_info=True
+            )
             raise InfrastructureError(
                 f"Failed to query workloads: {str(e.response.text)}"
             ) from e
@@ -1313,6 +1382,10 @@ class CplnInfrastructure(Infrastructure):
         except requests.exceptions.HTTPError as e:
             # If the workload doesn't exist, raise an error if the status code is not 404
             if e.response.status_code != 404:
+                self._custom_logger.error(
+                    f"Failed to retrieve workload '{name}': {str(e.response.text)}",
+                    exc_info=True,
+                )
                 raise InfrastructureError(
                     f"Failed to retrieve workload '{name}': {str(e.response.text)}"
                 ) from e
@@ -1367,6 +1440,9 @@ class CplnInfrastructure(Infrastructure):
 
         # If the response status code is not 201, raise an exception with the response text
         if response.status_code != 201:
+            self._custom_logger.error(
+                f"Failed to start job: {response.text}", exc_info=True
+            )
             raise Exception(f"Failed to start job: {response.text}")
 
         # Extract the job ID from the response headers
@@ -1436,6 +1512,10 @@ class CplnInfrastructure(Infrastructure):
                     break
 
         except requests.exceptions.HTTPError as e:
+            self._custom_logger.error(
+                f"Failed to stop job {command_id}: {str(e.response.text)}",
+                exc_info=True,
+            )
             raise InfrastructureError(
                 f"Failed to stop job {command_id}: {str(e.response.text)}"
             ) from e
@@ -1477,6 +1557,11 @@ class CplnInfrastructure(Infrastructure):
             # Check if timeout has been exceeded
             elapsed_time = time.time() - start_time
             if elapsed_time >= self.pod_watch_timeout_seconds:
+                self._custom_logger.error(
+                    f"Timeout of {self.pod_watch_timeout_seconds}s exceeded "
+                    f"while waiting for {workload_link} deployments at location '{self.location}' to become ready.",
+                    exc_info=True,
+                )
                 raise InfrastructureError(
                     f"Timeout of {self.pod_watch_timeout_seconds}s exceeded "
                     f"while waiting for {workload_link} deployments at location '{self.location}' to become ready."
@@ -1539,11 +1624,11 @@ class CplnInfrastructure(Infrastructure):
         """
 
         # Log a message to indicate that the job is being monitored
-        self.logger.info(f"Job {workload_name!r}: Monitoring job...")
+        self._custom_logger.info("Monitoring job...")
 
         # Initialize the logs monitor to stream logs for the specified job
         logs_monitor = CplnLogsMonitor(
-            self.logger,
+            self._custom_logger,
             client,
             self.org,
             self.namespace,
@@ -1559,9 +1644,8 @@ class CplnInfrastructure(Infrastructure):
                 timeout=self.job_watch_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            self.logger.error(
-                f"Job {workload_name!r}: Job did not complete within "
-                f"timeout of {self.job_watch_timeout_seconds}s."
+            self._custom_logger.error(
+                f"Job did not complete within timeout of {self.job_watch_timeout_seconds}s."
             )
             return -1
 
@@ -1575,16 +1659,16 @@ class CplnInfrastructure(Infrastructure):
 
         # Determine the status code if not successful
         if lifecycle_stage == "failed":
-            self.logger.error(f"Job {workload_name!r}: Job has failed.")
+            self._custom_logger.error("Job has failed.")
             return 1
 
         if lifecycle_stage == "cancelled":
-            self.logger.error(f"Job {workload_name!r}: Job has been cancelled.")
+            self._custom_logger.error(f"Job {workload_name!r}: Job has been cancelled.")
             return 2
 
         if lifecycle_stage == "pending" or lifecycle_stage == "running":
             # Job is still running
-            self.logger.error(
+            self._custom_logger.error(
                 "An error occurred while waiting for the job to complete - exiting...",
                 exc_info=True,
             )
@@ -1593,7 +1677,7 @@ class CplnInfrastructure(Infrastructure):
             return 3
 
         # Log a message to indicate that the job has completed successfully
-        self.logger.info(f"Job {workload_name!r}: Job has completed successfully.")
+        self._custom_logger.info("Job has completed successfully.")
 
         # Return 0 to indicate that the job has completed successfully
         return 0
@@ -1628,6 +1712,13 @@ class CplnInfrastructure(Infrastructure):
 
         # Check if the job is running in the expected namespace
         if job_namespace != self.namespace:
+            self._custom_logger.error(
+                f"Unable to kill job {workload_name!r}: The job is running in namespace "
+                f"{job_namespace!r} but this worker expected jobs to be running in "
+                f"namespace {self.namespace!r} based on the work pool and "
+                "deployment configuration.",
+                exc_info=True,
+            )
             raise InfrastructureNotAvailable(
                 f"Unable to kill job {workload_name!r}: The job is running in namespace "
                 f"{job_namespace!r} but this worker expected jobs to be running in "
@@ -1637,6 +1728,11 @@ class CplnInfrastructure(Infrastructure):
 
         # Check if the job is running in the expected organization
         if job_org_name != self.org:
+            self._custom_logger.error(
+                f"Unable to kill job {workload_name!r}: The job is running on another "
+                "Control Plane organization than the one specified by the infrastructure PID.",
+                exc_info=True,
+            )
             raise InfrastructureNotAvailable(
                 f"Unable to kill job {workload_name!r}: The job is running on another "
                 "Control Plane organization than the one specified by the infrastructure PID."
@@ -1645,8 +1741,8 @@ class CplnInfrastructure(Infrastructure):
         # Attempt to delete the job's cron workload.
         try:
             # Notify of workload deletion
-            self.logger.info(
-                f"[CplnInfrastructure] Deleting workload '{workload_name}' in {grace_seconds} seconds."
+            self._custom_logger.info(
+                f"Deleting workload '{workload_name}' in {grace_seconds} seconds."
             )
 
             # Wait for the grace period before killing the job
@@ -1659,6 +1755,10 @@ class CplnInfrastructure(Infrastructure):
         except requests.RequestException as e:
             # Raise an error if the job was not found
             if e.response.status_code == 404:
+                self._custom_logger.error(
+                    f"Unable to kill job {workload_name!r}: The job was not found.",
+                    exc_info=True,
+                )
                 raise InfrastructureNotFound(
                     f"Unable to kill job {workload_name!r}: The job was not found."
                 ) from e
@@ -1970,8 +2070,8 @@ class CplnInfrastructure(Infrastructure):
                 client, workload_self_link
             ):
                 # Log workload deletion
-                self.logger.info(
-                    f"[CplnInfrastructure] Deleting workload '{workload_self_link}' because it is orphaned."
+                self._custom_logger.info(
+                    f"Deleting workload '{workload_self_link}' because it is orphaned."
                 )
 
                 # Delete the workload as it is orphaned
@@ -1986,7 +2086,7 @@ class CplnInfrastructure(Infrastructure):
                 # Iteratae over the links of the reliant resources and delete them
                 for link in links:
                     # Notify that we are about to delete a resource
-                    self.logger.info(f"[CplnInfrastructure] Deleting {link}")
+                    self._custom_logger.info(f"Deleting {link}")
 
                     # Delete the resources
                     client.delete(link)
