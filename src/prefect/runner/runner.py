@@ -508,7 +508,6 @@ class Runner:
                             workload=workload,
                             interval=self.query_seconds,
                             jitter_range=0.3,
-                            run_once=True,
                         )
                     )
 
