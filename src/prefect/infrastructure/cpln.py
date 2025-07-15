@@ -1669,7 +1669,7 @@ class CplnInfrastructure(Infrastructure):
         if lifecycle_stage == "pending" or lifecycle_stage == "running":
             # Job is still running
             self._custom_logger.error(
-                "An error occurred while waiting for the job to complete - exiting...",
+                "An error occurred while waiting for the job to complete - job is still running, exiting...",
                 exc_info=True,
             )
 
