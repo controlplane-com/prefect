@@ -8,6 +8,7 @@ For upgrade instructions, see https://docs.prefect.io/latest/guides/upgrade-guid
 """
 
 import inspect
+import os
 from typing import AsyncIterator, List, Optional, Set, Union
 from uuid import UUID
 
@@ -15,11 +16,13 @@ import anyio
 import anyio.abc
 import anyio.to_process
 import pendulum
+import requests
 
 from prefect._internal.compatibility.deprecated import (
     deprecated_class,
 )
 from prefect.blocks.core import Block
+from prefect.blocks.cpln import CplnClient, CplnInfrastructureConfig
 from prefect.client.orchestration import PrefectClient, get_client
 from prefect.client.schemas.filters import (
     FlowRunFilter,
@@ -84,6 +87,8 @@ class PrefectAgent:
         self.limit: Optional[int] = limit
         self.limiter: Optional[anyio.CapacityLimiter] = None
         self.client: Optional[PrefectClient] = None
+        self.cpln_client: Optional[CplnClient] = None
+        self.cpln_org: Optional[str] = os.getenv("CPLN_ORG")
 
         if isinstance(work_queue_prefix, str):
             work_queue_prefix = [work_queue_prefix]
@@ -663,6 +668,293 @@ class PrefectAgent:
 
         await self.task_group.start(wrapper)
 
+    # Control Plane Corp. Related ---------------------------------------------------------------
+
+    async def sync_failed_cpln_jobs_with_prefect(self):
+        """
+        Synchronize failed Control Plane (CPLN) jobs with Prefect flow runs.
+
+        This method checks for jobs running on the Control Plane platform that were
+        originally created by Prefect (tagged with `cpln/createdByPrefect=true`).
+        If any of these jobs have failed but the corresponding Prefect flow runs
+        are still marked as running, the flow runs are updated to a 'crashed' state
+        in Prefect.
+
+        This helps ensure that the Prefect server reflects the true job status
+        from the Control Plane platform, preventing discrepancies where failed
+        jobs appear to be still running in Prefect.
+        """
+
+        if not self.started:
+            raise RuntimeError(
+                "Agent is not started. Use `async with PrefectAgent()...`"
+            )
+
+        if not self.cpln_client:
+            self.logger.warning(
+                "Skipping Agent Control Plane monitoring because the CPLN client was not created successfully."
+            )
+            return
+
+        self.logger.info(
+            "[CPLN] Starting regular job failure check — "
+            "failed jobs still marked as running in Prefect will be set to 'crashed'."
+        )
+
+        work_queue_filter = (
+            WorkQueueFilter(name=WorkQueueFilterName(any_=list(self.work_queues)))
+            if self.work_queues
+            else None
+        )
+
+        work_pool_filter = (
+            WorkPoolFilter(name=WorkPoolFilterName(any_=[self.work_pool_name]))
+            if self.work_pool_name
+            else WorkPoolFilter(name=WorkPoolFilterName(any_=["default-agent-pool"]))
+        )
+        named_running_flow_runs = await self.client.read_flow_runs(
+            flow_run_filter=FlowRunFilter(
+                state=FlowRunFilterState(
+                    type=FlowRunFilterStateType(any_=[StateType.RUNNING]),
+                    name=FlowRunFilterStateName(any_=["Running"]),
+                ),
+            ),
+            work_pool_filter=work_pool_filter,
+            work_queue_filter=work_queue_filter,
+        )
+
+        typed_running_flow_runs = await self.client.read_flow_runs(
+            flow_run_filter=FlowRunFilter(
+                state=FlowRunFilterState(
+                    type=FlowRunFilterStateType(any_=[StateType.RUNNING]),
+                ),
+            ),
+            work_pool_filter=work_pool_filter,
+            work_queue_filter=work_queue_filter,
+        )
+
+        # Merge named and typed running flows into one list
+        running_flow_runs = named_running_flow_runs + typed_running_flow_runs
+
+        # If the running flow runs list is empty, exit early
+        if not running_flow_runs:
+            self.logger.info("[CPLN] Regular job failure check complete.")
+            return
+
+        # Variable to hold the workloads list
+        cpln_workloads: list = []
+
+        # Query all workloads that have the 'cpln/createdByPrefect' tag set to true
+        try:
+            # Construct the query object
+            query = {
+                "spec": {
+                    "match": "all",
+                    "terms": [
+                        {"op": "=", "tag": "cpln/createdByPrefect", "value": "true"}
+                    ],
+                }
+            }
+
+            # Query all workloads with the 'cpln/createdByPrefect' tag set to true
+            query_result_response = self.cpln_client.post(
+                f"/org/{self.cpln_org}/workload/-query", query
+            )
+
+            # Convert the response into a dict
+            query_result = query_result_response.json()
+
+            # Iterate over the items and add workloads to the list
+            for workload in query_result.get("items", []):
+                cpln_workloads.append(workload)
+        except requests.exceptions.HTTPError as e:
+            self.logger.warning(
+                f"[CPLN] Unable to fetch CPLN workloads created by Prefect: {e.response.text}"
+            )
+            return
+
+        # If no workload were found, exit early
+        if not cpln_workloads:
+            self.logger.info("[CPLN] Regular job failure check complete.")
+            return
+
+        # Iterate over each flow run in the list and then iterate over each workload
+        # to perform a /-command/-query for jobs tagged with the flow run ID.
+        # If the lifecycle stage of the job is 'failed', mark the flow run as 'crashed'.
+        for flow_run in running_flow_runs:
+            # Iterate over each workload and attempt to find the job that is operating the flow run
+            for workload in cpln_workloads:
+                # Extract workload name into a variable
+                workload_name = workload["name"]
+
+                # Get self link of the workload
+                workload_self_link = self._get_self_href(workload["links"])
+
+                # Attempt to find the job execution command for this flow run in this workload and update its state as necessary
+                try:
+                    # Construct the query object
+                    query = {
+                        "spec": {
+                            "match": "all",
+                            "terms": [
+                                {
+                                    "op": "=",
+                                    "tag": "prefect.io/flow-run-id",
+                                    "value": str(flow_run.id),
+                                }
+                            ],
+                        }
+                    }
+
+                    # Fetch the command with the 'prefect.io/flow-run-id' tag set to the flow run id within the workload
+                    query_result_response = self.cpln_client.post(
+                        f"{workload_self_link}/-command/-query", query
+                    )
+
+                    # Convert the response into a dict
+                    query_result = query_result_response.json()
+
+                    # If the result has an empty list, then the job that is operating the flow run does not exist in this workload, skip check
+                    if not query_result.get("items", []):
+                        continue
+
+                    # If we got here then the job that is operating the flow run is found and it should be the very first item
+                    cpln_workload_command = query_result["items"][0]
+
+                    # If the job that is operating the flow run has completed, then mark the flow run as completed
+                    if cpln_workload_command["lifecycleStage"] == "completed":
+                        self.logger.info(
+                            f"[CPLN] Flow run '{flow_run.id}' is operated by job execution command "
+                            f"'{cpln_workload_command['id']}' in workload '{workload_self_link}'. "
+                            f"Job lifecycle stage is 'completed' - setting Prefect flow run state to 'completed'."
+                        )
+                        await self._mark_flow_run_as_completed(flow_run)
+
+                    # If the job that is operating the flow run has failed, then mark the flow run as crashed
+                    if cpln_workload_command["lifecycleStage"] == "failed":
+                        self.logger.info(
+                            f"[CPLN] Flow run '{flow_run.id}' is operated by job execution command "
+                            f"'{cpln_workload_command['id']}' in workload '{workload_self_link}'. "
+                            f"Job lifecycle stage is 'failed' - setting Prefect flow run state to 'crashed'."
+                        )
+                        await self._mark_flow_run_as_crashed(flow_run)
+
+                    # Break the workload iteration loop, no need to look into other workloads since we found the job that is operating the flow run
+                    break
+
+                except requests.exceptions.HTTPError as e:
+                    self.logger.error(
+                        f"[CPLN] Unable to query commands for workload '{workload_name}': {e.response.text}"
+                    )
+                    return
+                except Exception as e:
+                    self.logger.error(
+                        f"[CPLN] Unable to process command for workload '{workload_name}': {e}"
+                    )
+                    return
+
+        # Let the user know that the regular check has completed
+        self.logger.info("[CPLN] Regular job failure check complete.")
+
+    def _get_self_href(self, links: list) -> Optional[str]:
+        """
+        Retrieve the 'href' value of the link whose 'rel' property is set to 'self'.
+
+        Args:
+            links (list[dict]): A list of link dictionaries,
+                where each dictionary contains at least 'rel' and 'href' keys.
+
+        Returns:
+            Optional[str]: The 'href' value for the link with 'rel' == 'self',
+            or None if no such link exists.
+        """
+        # Iterate through each link dictionary in the provided list
+        for link in links:
+            # If the 'rel' property is set to 'self', return the associated 'href'
+            if link.get("rel") == "self":
+                return link.get("href")
+
+        # Return None if no link with 'rel' == 'self' was found
+        return None
+
+    async def _mark_flow_run_as_completed(
+        self, flow_run: FlowRun, state_updates: Optional[dict] = None
+    ) -> None:
+        state_updates = state_updates or {}
+        state_updates.setdefault("name", "Completed")
+        state_updates.setdefault("type", StateType.COMPLETED)
+        state = flow_run.state.copy(update=state_updates)
+
+        await self.client.set_flow_run_state(flow_run.id, state, force=True)
+
+    async def _mark_flow_run_as_crashed(
+        self, flow_run: FlowRun, state_updates: Optional[dict] = None
+    ) -> None:
+        state_updates = state_updates or {}
+        state_updates.setdefault("name", "Crashed")
+        state_updates.setdefault("type", StateType.CRASHED)
+        state = flow_run.state.copy(update=state_updates)
+
+        await self.client.set_flow_run_state(flow_run.id, state, force=True)
+
+    def _get_cpln_client(self) -> Optional[CplnClient]:
+        """
+        Create and validate a Control Plane (CPLN) client.
+
+        This method attempts to:
+        1. Read the CPLN organization name and authentication token from environment variables.
+        2. Create a CPLN client using the provided credentials.
+        3. Validate access to the platform by fetching the organization details.
+
+        If either the environment variables are missing or validation fails,
+        monitoring will be skipped by returning `None`.
+        """
+
+        self.logger.info(
+            "Creating the CPLN client using the CPLN_TOKEN specified in the environment."
+        )
+
+        # Extract the authentication token from the environment
+        token = os.getenv("CPLN_TOKEN")
+
+        # If organization name is missing, skip client creation
+        if not self.cpln_org:
+            self.logger.warning(
+                "Failed to create the CPLN client, CPLN_ORG environment variable is not set. "
+                "Please set CPLN_ORG so the agent can create the CPLN client."
+            )
+
+            # Return None to indicate that the client has not been created successfully
+            return None
+
+        # If token is missing, skip client creation
+        if not token:
+            self.logger.warning(
+                "Failed to create the CPLN client, CPLN_TOKEN environment variable is not set. "
+                "Please set CPLN_TOKEN so the agent can create the CPLN client."
+            )
+
+            # Return None to indicate that the client has not been created successfully
+            return None
+
+        # Create the CPLN client
+        cpln_client = CplnInfrastructureConfig().get_api_client()
+
+        # Validate platform access by fetching the organization
+        try:
+            cpln_client.get(f"/org/{self.cpln_org}")
+        except requests.exceptions.HTTPError as e:
+            self.logger.warning(
+                f"Failed to fetch CPLN organization '{self.cpln_org}': {e.response.text}",
+                exc_info=True,
+            )
+
+            # Return None to indicate that the client has not been created successfully
+            return None
+
+        # Return the CPLN client
+        return cpln_client
+
     # Context management ---------------------------------------------------------------
 
     async def start(self):
@@ -672,6 +964,7 @@ class PrefectAgent:
             anyio.CapacityLimiter(self.limit) if self.limit is not None else None
         )
         self.client = get_client()
+        self.cpln_client = self._get_cpln_client()
         await self.client.__aenter__()
         await self.task_group.__aenter__()
 
@@ -684,6 +977,8 @@ class PrefectAgent:
         await self.client.__aexit__(*exc_info)
         self.task_group = None
         self.client = None
+        self.cpln_client = None
+        self.cpln_org = None
         self.submitting_flow_run_ids.clear()
         self.cancelling_flow_run_ids.clear()
         self.scheduled_task_scopes.clear()

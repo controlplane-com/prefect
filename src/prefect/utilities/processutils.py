@@ -407,8 +407,8 @@ def setup_signal_handlers_worker(pid: int, process_name: str, print_fn: Callable
     else:
         # forward first SIGINT directly, send SIGKILL on subsequent interrupt
         setup_handler(signal.SIGINT, signal.SIGINT, signal.SIGKILL)
-        # first SIGTERM: send SIGINT, send SIGKILL on subsequent SIGTERM
-        setup_handler(signal.SIGTERM, signal.SIGINT, signal.SIGKILL)
+        # Make SIGTERM immediate: forward SIGTERM directly, then SIGKILL on repeat
+        setup_handler(signal.SIGTERM, signal.SIGTERM, signal.SIGKILL)
 
 
 def get_sys_executable() -> str:

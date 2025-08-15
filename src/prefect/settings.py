@@ -1007,6 +1007,15 @@ The agent loop interval, in seconds. Agents will check for new runs this often.
 Defaults to `15`.
 """
 
+PREFECT_AGENT_CPLN_MONITOR_INTERVAL = Setting(
+    int,
+    default=60,
+)
+"""
+The agent cpln monitor loop interval, in seconds. Agents will monitor cpln flow run and
+sync the state of the running jobs with these flow runs for new runs this often. Defaults to `60`.
+"""
+
 PREFECT_AGENT_PREFETCH_SECONDS = Setting(
     int,
     default=15,
