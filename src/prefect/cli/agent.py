@@ -21,6 +21,7 @@ from prefect.client.schemas.filters import WorkQueueFilter, WorkQueueFilterName
 from prefect.exceptions import ObjectNotFound
 from prefect.logging import get_logger
 from prefect.settings import (
+    PREFECT_AGENT_CPLN_MONITOR_INTERVAL,
     PREFECT_AGENT_PREFETCH_SECONDS,
     PREFECT_AGENT_QUERY_INTERVAL,
     PREFECT_API_URL,
@@ -242,6 +243,18 @@ async def start(
                         critical_service_loop,
                         agent.check_for_cancelled_flow_runs,
                         PREFECT_AGENT_QUERY_INTERVAL.value() * 2,
+                        printer=app.console.print,
+                        run_once=run_once,
+                        jitter_range=0.3,
+                        backoff=4,
+                    )
+                )
+
+                tg.start_soon(
+                    partial(
+                        critical_service_loop,
+                        agent.sync_failed_cpln_jobs_with_prefect,
+                        PREFECT_AGENT_CPLN_MONITOR_INTERVAL.value(),
                         printer=app.console.print,
                         run_once=run_once,
                         jitter_range=0.3,
