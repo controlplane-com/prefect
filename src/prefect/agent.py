@@ -89,6 +89,9 @@ class PrefectAgent:
         self.client: Optional[PrefectClient] = None
         self.cpln_client: Optional[CplnClient] = None
         self.cpln_org: Optional[str] = os.getenv("CPLN_ORG")
+        self.cpln_warned_flow_run_ids: Set[
+            UUID
+        ] = set()  # Track flow runs we've warned about for invalid PID format
 
         if isinstance(work_queue_prefix, str):
             work_queue_prefix = [work_queue_prefix]
@@ -828,7 +831,13 @@ class PrefectAgent:
                             f"'{cpln_workload_command['id']}' in workload '{workload_self_link}'. "
                             f"Job lifecycle stage is 'completed' - setting Prefect flow run state to 'completed'."
                         )
-                        await self._mark_flow_run_as_completed(flow_run)
+                        try:
+                            await self._mark_flow_run_as_completed(flow_run)
+                        except Exception as e:
+                            self.logger.error(
+                                f"[CPLN] Failed to update flow run '{flow_run.id}' state to completed: {e}",
+                                exc_info=True,
+                            )
 
                     # If the job that is operating the flow run has failed, then mark the flow run as crashed
                     if cpln_workload_command["lifecycleStage"] == "failed":
@@ -837,21 +846,31 @@ class PrefectAgent:
                             f"'{cpln_workload_command['id']}' in workload '{workload_self_link}'. "
                             f"Job lifecycle stage is 'failed' - setting Prefect flow run state to 'crashed'."
                         )
-                        await self._mark_flow_run_as_crashed(flow_run)
+                        try:
+                            await self._mark_flow_run_as_crashed(flow_run)
+                        except Exception as e:
+                            self.logger.error(
+                                f"[CPLN] Failed to update flow run '{flow_run.id}' state to crashed: {e}",
+                                exc_info=True,
+                            )
 
                     # Break the workload iteration loop, no need to look into other workloads since we found the job that is operating the flow run
                     break
 
                 except requests.exceptions.HTTPError as e:
                     self.logger.error(
-                        f"[CPLN] Unable to query commands for workload '{workload_name}': {e.response.text}"
+                        f"[CPLN] Unable to query commands for workload '{workload_name}': {e.response.text}",
+                        exc_info=True,
                     )
-                    return
+                    # Continue to next workload instead of returning - don't let one failure stop all processing
+                    continue
                 except Exception as e:
                     self.logger.error(
-                        f"[CPLN] Unable to process command for workload '{workload_name}': {e}"
+                        f"[CPLN] Unable to process command for workload '{workload_name}': {e}",
+                        exc_info=True,
                     )
-                    return
+                    # Continue to next workload instead of returning - don't let one failure stop all processing
+                    continue
 
         # Let the user know that the regular check has completed
         self.logger.info("[CPLN] Regular job failure check complete.")
@@ -896,6 +915,224 @@ class PrefectAgent:
         state = flow_run.state.copy(update=state_updates)
 
         await self.client.set_flow_run_state(flow_run.id, state, force=True)
+
+    async def sync_prefect_terminal_flow_runs_with_cpln(self):
+        """
+        Synchronize terminal Prefect flow runs with Control Plane (CPLN) jobs.
+
+        This method checks for flow runs that have reached terminal states
+        (completed, failed, crashed, cancelled) in Prefect but whose corresponding
+        Control Plane job executions are still active/running. If found, it
+        terminates those jobs to prevent unnecessary resource consumption and costs.
+
+        This is the reverse sync of sync_failed_cpln_jobs_with_prefect(), ensuring
+        bidirectional consistency between Prefect and Control Plane.
+        """
+
+        if not self.started:
+            raise RuntimeError(
+                "Agent is not started. Use `async with PrefectAgent()...`"
+            )
+
+        if not self.cpln_client:
+            self.logger.warning(
+                "Skipping Agent Control Plane cleanup because the CPLN client was not created successfully."
+            )
+            return
+
+        self.logger.info(
+            "[CPLN] Starting terminal flow run cleanup — "
+            "terminal flow runs with active CPLN jobs will have those jobs terminated."
+        )
+
+        work_queue_filter = (
+            WorkQueueFilter(name=WorkQueueFilterName(any_=list(self.work_queues)))
+            if self.work_queues
+            else None
+        )
+
+        work_pool_filter = (
+            WorkPoolFilter(name=WorkPoolFilterName(any_=[self.work_pool_name]))
+            if self.work_pool_name
+            else WorkPoolFilter(name=WorkPoolFilterName(any_=["default-agent-pool"]))
+        )
+
+        # Query flow runs in terminal states
+        terminal_flow_runs = await self.client.read_flow_runs(
+            flow_run_filter=FlowRunFilter(
+                state=FlowRunFilterState(
+                    type=FlowRunFilterStateType(
+                        any_=[
+                            StateType.COMPLETED,
+                            StateType.FAILED,
+                            StateType.CRASHED,
+                            StateType.CANCELLED,
+                        ]
+                    ),
+                ),
+            ),
+            work_pool_filter=work_pool_filter,
+            work_queue_filter=work_queue_filter,
+        )
+
+        # If no terminal flow runs, exit early
+        if not terminal_flow_runs:
+            self.logger.info("[CPLN] Terminal flow run cleanup complete.")
+            return
+
+        # Filter for flow runs with infrastructure PIDs (means they were executed on CPLN)
+        terminal_flow_runs_with_pid = [
+            fr for fr in terminal_flow_runs if fr.infrastructure_pid
+        ]
+
+        if not terminal_flow_runs_with_pid:
+            self.logger.info("[CPLN] Terminal flow run cleanup complete.")
+            return
+
+        # For each terminal flow run, check if its CPLN job is still active
+        for flow_run in terminal_flow_runs_with_pid:
+            try:
+                # Parse the infrastructure PID to extract workload and command info
+                # Format: "org:namespace:workload_name:command_id"
+                pid_parts = flow_run.infrastructure_pid.split(":", 3)
+                if len(pid_parts) != 4:
+                    # Only warn once per flow run to avoid log spam
+                    if flow_run.id not in self.cpln_warned_flow_run_ids:
+                        self.logger.warning(
+                            f"[CPLN] Invalid infrastructure PID format for flow run '{flow_run.id}': {flow_run.infrastructure_pid}"
+                        )
+                        self.cpln_warned_flow_run_ids.add(flow_run.id)
+                    continue
+
+                org_name, gvc_name, workload_name, command_id = pid_parts
+
+                # Only process if org matches
+                if org_name != self.cpln_org:
+                    continue
+
+                # Construct workload self link
+                workload_self_link = (
+                    f"/org/{org_name}/gvc/{gvc_name}/workload/{workload_name}"
+                )
+
+                # Check if the command (job) still exists and is active
+                try:
+                    command_link = f"{workload_self_link}/-command/{command_id}"
+
+                    # Skip error logging for 404s since they're expected (job already cleaned up)
+                    command = self.cpln_client.get(
+                        command_link, skipStatusErrorMessage=True
+                    )
+
+                    # Check if the job is in a non-terminal state
+                    lifecycle_stage = command.get("lifecycleStage", "")
+
+                    # If job is still active (pending or running), terminate it
+                    if lifecycle_stage in ["pending", "running"]:
+                        self.logger.warning(
+                            f"[CPLN] Flow run '{flow_run.id}' is in terminal state '{flow_run.state.type.value}' "
+                            f"but CPLN job '{command_id}' in workload '{workload_self_link}' is still '{lifecycle_stage}'. "
+                            f"Terminating the job to prevent resource waste."
+                        )
+
+                        # Fetch deployments to find and stop the replica
+                        deployment_list = self.cpln_client.get(
+                            f"{workload_self_link}/deployment"
+                        )
+
+                        # Find the job execution and stop it
+                        # Following the same pattern as _stop_job in cpln.py
+                        job_found = False
+                        job_terminated = False
+
+                        for deployment in deployment_list.get("items", []):
+                            # If there are no job executions, skip deployment
+                            if not deployment.get("jobExecutions"):
+                                continue
+
+                            # Iterate over each job execution to find the target job
+                            for job in deployment["jobExecutions"]:
+                                # Check if the name of the job includes the command id
+                                if command_id not in job.get("name", ""):
+                                    continue
+
+                                # Mark that the job has been found
+                                job_found = True
+
+                                # Skip if the job has no replica
+                                # Following cpln.py pattern: break if no replica found
+                                if "replica" not in job:
+                                    self.logger.warning(
+                                        f"[CPLN] Job '{command_id}' found but has no replica to terminate"
+                                    )
+                                    break
+
+                                # Get location from deployment name (confirmed by _check_workload_readiness in cpln.py)
+                                location = deployment.get("name")
+                                if not location:
+                                    self.logger.error(
+                                        f"[CPLN] Deployment has no name/location for job '{command_id}'"
+                                    )
+                                    break
+
+                                # Construct the stop command body (same structure as cpln.py)
+                                stop_command = {
+                                    "type": "stopReplica",
+                                    "spec": {
+                                        "replica": job["replica"],
+                                        "location": location,
+                                    },
+                                }
+
+                                try:
+                                    # Make the POST request to stop the replica
+                                    self.cpln_client.post(
+                                        f"{workload_self_link}/-command", stop_command
+                                    )
+                                    self.logger.info(
+                                        f"[CPLN] Successfully terminated job '{command_id}' "
+                                        f"(replica: {job['replica']}, location: {location}) "
+                                        f"in workload '{workload_self_link}'"
+                                    )
+                                    job_terminated = True
+                                except requests.exceptions.HTTPError as e:
+                                    self.logger.error(
+                                        f"[CPLN] Failed to stop job '{command_id}': {e.response.text}",
+                                        exc_info=True,
+                                    )
+                                # Break after processing this job
+                                break
+
+                            # If the job has been found, stop looping through deployments
+                            if job_found:
+                                break
+
+                        # Log appropriate message based on what happened
+                        if not job_found:
+                            self.logger.warning(
+                                f"[CPLN] Job '{command_id}' not found in any deployment for workload '{workload_self_link}'"
+                            )
+                        elif not job_terminated:
+                            self.logger.warning(
+                                f"[CPLN] Job '{command_id}' found but could not be terminated (no replica or other issue)"
+                            )
+
+                except requests.exceptions.HTTPError as e:
+                    # 404 means the job no longer exists, which is fine
+                    if e.response.status_code == 404:
+                        continue
+                    else:
+                        self.logger.error(
+                            f"[CPLN] Failed to check status of job '{command_id}' for flow run '{flow_run.id}': {e.response.text}"
+                        )
+
+            except Exception as e:
+                self.logger.error(
+                    f"[CPLN] Error processing terminal flow run '{flow_run.id}': {e}",
+                    exc_info=True,
+                )
+
+        self.logger.info("[CPLN] Terminal flow run cleanup complete.")
 
     def _get_cpln_client(self) -> Optional[CplnClient]:
         """

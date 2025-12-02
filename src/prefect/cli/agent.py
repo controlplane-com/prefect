@@ -261,6 +261,18 @@ async def start(
                         backoff=4,
                     )
                 )
+
+                tg.start_soon(
+                    partial(
+                        critical_service_loop,
+                        agent.sync_prefect_terminal_flow_runs_with_cpln,
+                        PREFECT_AGENT_CPLN_MONITOR_INTERVAL.value(),
+                        printer=app.console.print,
+                        run_once=run_once,
+                        jitter_range=0.3,
+                        backoff=4,
+                    )
+                )
         except CancelledError:
             logger.debug("Agent task group cancelled")
 
