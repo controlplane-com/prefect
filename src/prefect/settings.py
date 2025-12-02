@@ -1012,8 +1012,12 @@ PREFECT_AGENT_CPLN_MONITOR_INTERVAL = Setting(
     default=60,
 )
 """
-The agent cpln monitor loop interval, in seconds. Agents will monitor cpln flow run and
-sync the state of the running jobs with these flow runs for new runs this often. Defaults to `60`.
+The agent Control Plane monitor loop interval, in seconds. The agent performs two types of 
+bidirectional sync at this interval:
+1. CPLN → Prefect: Checks if CPLN jobs have failed/completed and updates corresponding Prefect flow runs
+2. Prefect → CPLN: Checks if Prefect flow runs are in terminal states but their CPLN jobs are still 
+   running, and terminates those jobs to prevent resource waste
+Defaults to `60` seconds.
 """
 
 PREFECT_AGENT_PREFETCH_SECONDS = Setting(
