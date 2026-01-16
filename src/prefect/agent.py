@@ -1047,11 +1047,11 @@ class PrefectAgent:
 
                         for deployment in deployment_list.get("items", []):
                             # If there are no job executions, skip deployment
-                            if not deployment.get("jobExecutions"):
+                            if not deployment.get("status",{}).get("jobExecutions"):
                                 continue
 
                             # Iterate over each job execution to find the target job
-                            for job in deployment["jobExecutions"]:
+                            for job in deployment["status"]["jobExecutions"]:
                                 # Check if the name of the job includes the command id
                                 if command_id not in job.get("name", ""):
                                     continue
