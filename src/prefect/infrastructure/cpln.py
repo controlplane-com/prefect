@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -57,6 +58,7 @@ RETRY_WORKLOAD_READY_CHECK_SECONDS = 2
 # Tags Related
 PREFECT_IDENTIFIER_TAG_KEY = "cpln/createdByPrefect"
 CPLN_WORKLOAD_SPEC_HASH_TAG_KEY = "cpln/specHash"
+CPLN_PREFECT_JOB_TYPE_TAG_KEY = "cpln/prefectJobType"
 
 # Workload Related
 DEFAULT_CONTAINER_NAME = "prefect-job"
@@ -308,6 +310,7 @@ class CplnKubernetesConverter:
         org: str,
         namespace: str,
         k8s_job: KubernetesObjectManifest,
+        job_type: Optional[str] = None,
     ):
         # Set received parameters
         self._logger = logger
@@ -315,16 +318,20 @@ class CplnKubernetesConverter:
         self._org = org
         self._namespace = namespace
         self._k8s_job = k8s_job
+        self._job_type = job_type
 
         # Converter related
         self.is_identity_overridden = False
 
-        # Extract job name from the manifest
+        # Extract job name from the manifest (used as fallback if no job_type)
         self._k8s_job_name = k8s_job["metadata"]["generateName"]
 
-        # Define identity and policy name
-        self._policy_name = f"{self._k8s_job_name}-reveal-policy"
-        self._identity_name = f"{self._k8s_job_name}-identity"
+        # Use job_type as workload name if specified, otherwise use k8s job name
+        self._workload_name = job_type if job_type else self._k8s_job_name
+
+        # Define identity and policy name (use workload name for consistency)
+        self._policy_name = f"{self._workload_name}-reveal-policy"
+        self._identity_name = f"{self._workload_name}-identity"
 
         # Define identity and policy links
         self._policy_parent_link = f"/org/{self._org}/policy"
@@ -407,7 +414,7 @@ class CplnKubernetesConverter:
         # Return the Control Plane cron workload manifest
         return {
             "kind": "workload",
-            "name": self._k8s_job_name,
+            "name": self._workload_name,
             "tags": {},
             "spec": workload_spec,
         }
@@ -964,6 +971,16 @@ class CplnInfrastructure(Infrastructure):
     service_account_name: Optional[str] = Field(
         default=None, description="The Control Plane identity to use for this job."
     )
+    job_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "An optional identifier used to group jobs into separate Control Plane workloads. "
+            "Jobs with different job_type values will create separate workloads, "
+            "allowing you to monitor infrastructure resource consumption per job type. "
+            "Must contain only lowercase alphanumeric characters and dashes, "
+            "and must start and end with an alphanumeric character (e.g., 'ml-training', 'data-processing')."
+        ),
+    )
     job: KubernetesObjectManifest = Field(
         default_factory=lambda: CplnInfrastructure.base_job_manifest(),
         description="The base manifest for the Kubernetes Job.",
@@ -1031,6 +1048,38 @@ class CplnInfrastructure(Infrastructure):
         cls, value: Union[List[Dict], JsonPatch, str]
     ) -> JsonPatch:
         return cast_k8s_job_customizations(cls, value)
+
+    @validator("job_type")
+    def validate_job_type(cls, value: Optional[str]) -> Optional[str]:
+        """
+        Validate that job_type follows Control Plane naming conventions.
+
+        Must contain only lowercase alphanumeric characters and dashes,
+        and must start and end with an alphanumeric character.
+        Maximum length is 63 characters (Control Plane tag value limit).
+        """
+        if value is None:
+            return value
+
+        # Check maximum length
+        if len(value) > 63:
+            raise ValueError(
+                f"job_type must be 63 characters or less, got {len(value)} characters."
+            )
+
+        # Check minimum length
+        if len(value) < 1:
+            raise ValueError("job_type cannot be an empty string.")
+
+        # Check pattern: lowercase alphanumeric and dashes, must start and end with alphanumeric
+        pattern = r"^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$"
+        if not re.match(pattern, value):
+            raise ValueError(
+                f"job_type must contain only lowercase alphanumeric characters and dashes, "
+                f"and must start and end with an alphanumeric character. Got: '{value}'"
+            )
+
+        return value
 
     ### Class Methods ###
 
@@ -1119,7 +1168,12 @@ class CplnInfrastructure(Infrastructure):
 
         # Initialize the Control Plane Kubernetes converter
         self.cpln_k8s_converter = CplnKubernetesConverter(
-            self._custom_logger, client, self.org, self.namespace, k8s_job
+            self._custom_logger,
+            client,
+            self.org,
+            self.namespace,
+            k8s_job,
+            self.job_type,
         )
 
         # Create the cron workload
@@ -1263,6 +1317,10 @@ class CplnInfrastructure(Infrastructure):
             }
         )
 
+        # Add job_type tag if specified
+        if self.job_type:
+            manifest["tags"][f"{CPLN_PREFECT_JOB_TYPE_TAG_KEY}"] = self.job_type
+
     @retry(
         stop=stop_after_attempt(RETRY_MAX_ATTEMPTS),
         wait=wait_fixed(RETRY_MIN_DELAY_SECONDS)
@@ -1302,23 +1360,45 @@ class CplnInfrastructure(Infrastructure):
 
         # Attempt to find a workload with matching hash
         try:
+            # Build the base query terms
+            query_terms = [
+                {"op": "=", "rel": "gvc", "value": self.namespace},
+                {
+                    "op": "=",
+                    "tag": f"{PREFECT_IDENTIFIER_TAG_KEY}",
+                    "value": "true",
+                },
+                {
+                    "op": "=",
+                    "tag": f"{CPLN_WORKLOAD_SPEC_HASH_TAG_KEY}",
+                    "value": spec_hash,
+                },
+            ]
+
+            # Add job_type to query terms if specified
+            if self.job_type:
+                query_terms.append(
+                    {
+                        "op": "=",
+                        "tag": f"{CPLN_PREFECT_JOB_TYPE_TAG_KEY}",
+                        "value": self.job_type,
+                    }
+                )
+            else:
+                # If no job_type is specified, only match workloads without a job_type tag
+                # This ensures backward compatibility and prevents reusing typed workloads
+                query_terms.append(
+                    {
+                        "op": "!exists",
+                        "tag": f"{CPLN_PREFECT_JOB_TYPE_TAG_KEY}",
+                    }
+                )
+
             # Construct the query object
             query = {
                 "spec": {
                     "match": "all",
-                    "terms": [
-                        {"op": "=", "rel": "gvc", "value": self.namespace},
-                        {
-                            "op": "=",
-                            "tag": f"{PREFECT_IDENTIFIER_TAG_KEY}",
-                            "value": "true",
-                        },
-                        {
-                            "op": "=",
-                            "tag": f"{CPLN_WORKLOAD_SPEC_HASH_TAG_KEY}",
-                            "value": spec_hash,
-                        },
-                    ],
+                    "terms": query_terms,
                 }
             }
 

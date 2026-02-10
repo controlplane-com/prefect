@@ -443,30 +443,48 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
         prefect.plugins.load_prefect_collections()
 
         blocks_registry = get_registry_for_type(Block)
+
+        # Calculate schema checksums to detect field changes in block classes.
+        block_schema_checksums = {
+            name: block_class._calculate_schema_checksum()
+            for name, block_class in (blocks_registry or {}).items()
+        }
+
         collection_blocks_data = await _load_collection_blocks_data()
+
+        # Create a combined hash that includes schema checksums
         current_blocks_loading_hash = hash_objects(
             blocks_registry,
+            block_schema_checksums,
             collection_blocks_data,
             PREFECT_API_DATABASE_CONNECTION_URL.value(),
             hash_algo=sha256,
         )
 
         memo_store_path = PREFECT_MEMO_STORE_PATH.value()
+        should_register = True
+
         try:
             if memo_store_path.exists():
-                saved_blocks_loading_hash = toml.load(memo_store_path).get(
-                    "block_auto_registration"
-                )
+                memo_data = toml.load(memo_store_path)
+                saved_blocks_loading_hash = memo_data.get("block_auto_registration")
+                saved_schema_checksums = memo_data.get("block_schema_checksums", {})
+
+                # Check if main hash matches AND all schema checksums match
+                # This ensures re-registration when any block's fields change
+                checksums_match = saved_schema_checksums == block_schema_checksums
+
                 if (
                     saved_blocks_loading_hash is not None
                     and current_blocks_loading_hash == saved_blocks_loading_hash
+                    and checksums_match
                 ):
                     if PREFECT_DEBUG_MODE.value():
                         logger.debug(
                             "Skipping block loading due to matching hash for block "
                             "auto-registration found in memo store."
                         )
-                    return
+                    should_register = False
         except Exception as exc:
             logger.warning(
                 ""
@@ -475,6 +493,9 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
                 "All blocks will be registered."
             )
 
+        if not should_register:
+            return
+
         await fn(*args, **kwargs)
 
         if current_blocks_loading_hash is not None:
@@ -482,8 +503,15 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
                 if not memo_store_path.exists():
                     memo_store_path.touch(mode=0o0600)
 
+                # Store both the hash and individual schema checksums
+                # This allows automatic detection of any schema changes
                 memo_store_path.write_text(
-                    toml.dumps({"block_auto_registration": current_blocks_loading_hash})
+                    toml.dumps(
+                        {
+                            "block_auto_registration": current_blocks_loading_hash,
+                            "block_schema_checksums": block_schema_checksums,
+                        }
+                    )
                 )
             except Exception as exc:
                 logger.warning(

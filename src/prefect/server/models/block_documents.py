@@ -22,6 +22,53 @@ from prefect.server.utilities.names import obfuscate_string
 from prefect.utilities.collections import dict_to_flatdict, flatdict_to_dict
 from prefect.utilities.names import obfuscate
 
+
+def _get_default_value_from_schema(field_schema: dict):
+    """
+    Extract the default value from a field schema definition.
+    Returns None if no default is defined.
+    """
+    if "default" in field_schema:
+        return field_schema["default"]
+    return None
+
+
+def _add_new_schema_fields_to_data(
+    data: dict, current_schema_fields: dict, latest_schema_fields: dict
+) -> dict:
+    """
+    Add new fields from the latest schema into the block document data.
+
+    This ensures that when a block schema adds new fields, existing block documents
+    will show those fields in the UI with their default values.
+
+    Args:
+        data: The current block document data
+        current_schema_fields: The schema fields from the stored block schema
+        latest_schema_fields: The schema fields from the latest block schema
+
+    Returns:
+        A new data dictionary with new fields added (original is not modified)
+    """
+    # Make a copy to avoid modifying the original data
+    merged_data = copy(data) if data else {}
+
+    current_properties = current_schema_fields.get("properties", {})
+    latest_properties = latest_schema_fields.get("properties", {})
+
+    # Find fields that exist in latest schema but not in current schema
+    new_field_names = set(latest_properties.keys()) - set(current_properties.keys())
+
+    for field_name in new_field_names:
+        # Only add if not already in data
+        if field_name not in merged_data:
+            field_schema = latest_properties[field_name]
+            default_value = _get_default_value_from_schema(field_schema)
+            merged_data[field_name] = default_value
+
+    return merged_data
+
+
 if TYPE_CHECKING:
     from prefect.server.database.orm_models import ORMBlockDocument
 
@@ -415,21 +462,59 @@ async def read_block_documents(
             )
             visited_block_document_ids.append(root_orm_block_document.id)
 
+    # Get the stored schemas (the ones block documents were created with)
     block_schema_ids = [
         block_document.block_schema_id
         for block_document in fully_constructed_block_documents
     ]
-    block_schemas = await models.block_schemas.read_block_schemas(
+    stored_block_schemas = await models.block_schemas.read_block_schemas(
         session=session,
         block_schema_filter=BlockSchemaFilter(id=dict(any_=block_schema_ids)),
     )
-    for block_document in fully_constructed_block_documents:
-        corresponding_block_schema = next(
-            block_schema
-            for block_schema in block_schemas
-            if block_schema.id == block_document.block_schema_id
+    stored_schemas_by_id = {schema.id: schema for schema in stored_block_schemas}
+
+    # Get the latest schema for each block type.
+    # Old schemas are cleaned up on server startup, so the latest is the current one.
+    block_type_ids = list(
+        set(
+            block_document.block_type_id
+            for block_document in fully_constructed_block_documents
         )
-        block_document.block_schema = corresponding_block_schema
+    )
+
+    latest_schemas_by_block_type = {}
+    for block_type_id in block_type_ids:
+        latest_schemas = await models.block_schemas.read_block_schemas(
+            session=session,
+            block_schema_filter=BlockSchemaFilter(
+                block_type_id=dict(any_=[block_type_id])
+            ),
+            limit=1,
+        )
+        if latest_schemas:
+            latest_schemas_by_block_type[block_type_id] = latest_schemas[0]
+
+    # Attach the latest schema to each block document and merge new fields into data
+    for block_document in fully_constructed_block_documents:
+        stored_schema = stored_schemas_by_id.get(block_document.block_schema_id)
+        latest_schema = latest_schemas_by_block_type.get(block_document.block_type_id)
+
+        if latest_schema and stored_schema:
+            # Add new fields from latest schema to block document data
+            block_document.data = _add_new_schema_fields_to_data(
+                data=block_document.data,
+                current_schema_fields=stored_schema.fields,
+                latest_schema_fields=latest_schema.fields,
+            )
+            # Use the latest schema so UI shows all current fields
+            block_document.block_schema = latest_schema
+        elif latest_schema:
+            # Use latest schema if stored schema was deleted
+            block_document.block_schema = latest_schema
+        elif stored_schema:
+            # Fallback to stored schema if latest not found
+            block_document.block_schema = stored_schema
+
     return fully_constructed_block_documents
 
 
