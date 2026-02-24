@@ -44,9 +44,14 @@ else:
 
 # Jobs Related
 COMMAND_STATUS_CHECK_DELAY: int = 5
+COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS: int = 5
 JOB_WATCH_OFFSET_MINUTES: int = 5
 LIFECYCLE_FINAL_STAGES: List[str] = ["completed", "failed", "cancelled"]
 ORPHAN_TTL_HOURS: int = 24  # To determine whether a workload is orphaned or not
+
+# Monitor Related
+MONITOR_MAX_RETRIES: int = 3
+MONITOR_RETRY_DELAY_SECONDS: int = 10
 
 # Retry Related
 RETRY_MAX_ATTEMPTS = 3
@@ -59,6 +64,7 @@ RETRY_WORKLOAD_READY_CHECK_SECONDS = 2
 PREFECT_IDENTIFIER_TAG_KEY = "cpln/createdByPrefect"
 CPLN_WORKLOAD_SPEC_HASH_TAG_KEY = "cpln/specHash"
 CPLN_PREFECT_JOB_TYPE_TAG_KEY = "cpln/prefectJobType"
+CPLN_PREFECT_AGENT_TAG_KEY = "cpln/prefectAgent"
 
 # Workload Related
 DEFAULT_CONTAINER_NAME = "prefect-job"
@@ -96,6 +102,7 @@ class MetadataAdapter(logging.LoggerAdapter):
             extra
             or {
                 "k8s_labels": {},
+                "gvc": None,
                 "workload_name": None,
                 "command_id": None,
             },
@@ -119,6 +126,10 @@ class MetadataAdapter(logging.LoggerAdapter):
         # Add flow run name to metadata if available
         if labels.get("prefect.io/flow-run-name"):
             meta += f", Flow Run Name: {labels['prefect.io/flow-run-name']}"
+
+        # Add GVC to metadata if provided
+        if self.extra.get("gvc"):
+            meta += f", GVC: {self.extra['gvc']}"
 
         # Add workload name to metadata if provided
         if self.extra.get("workload_name"):
@@ -168,35 +179,39 @@ class CplnLogsMonitor:
         """
         Monitor the job status and logs.
 
+        Status monitoring (API polling) is the sole driver of when this method
+        returns. Log streaming runs independently alongside it — if log streaming
+        fails or disconnects, status monitoring continues unaffected.
+
         Args:
             print_func (Optional[Callable]): If provided, it will stream the logs by calling `print_func`
             for every log message received from the logs service.
+
+        Raises:
+            Exception: If the status monitoring task fails with an exception
+                (e.g. API errors after exhausting retries).
         """
 
-        # Define tasks
-        monitor_status_task = asyncio.create_task(self._monitor_job_status())
+        # Start log streaming as an independent background task.
+        # It has its own retry loop and will keep reconnecting on failures.
         monitor_logs_task = asyncio.create_task(self._monitor_job_logs(print_func))
-
-        # Store tasks into a list
-        tasks = [monitor_status_task, monitor_logs_task]
 
         # Log a message indicating status check and logs monitoring will start soon
         self._logger.info("Starting status check and logs monitoring...")
 
-        # Wait for either task to complete
-        _, pending = await asyncio.wait(
-            tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            # Wait for status monitoring to determine the job's final state.
+            # This is the only thing that controls when we return — log streaming
+            # failure will never cause an early exit.
+            await self._monitor_job_status()
+        finally:
+            # Ensure WebSocket disconnects
+            if self._websocket and not self._websocket.closed:
+                await self._websocket.close()
 
-        # Ensure WebSocket disconnects if the status monitoring triggers disconnection
-        if self._websocket and not self._websocket.closed:
-            # Close the WebSocket connection
-            await self._websocket.close()
-
-        # Cancel remaining tasks
-        for task in pending:
-            task.cancel()
+            # Cancel the log streaming task since status monitoring is done
+            if not monitor_logs_task.done():
+                monitor_logs_task.cancel()
 
     ### Private Methods ###
 
@@ -1157,6 +1172,7 @@ class CplnInfrastructure(Infrastructure):
             self.logger,
             {
                 "k8s_labels": k8s_job_metadata_labels,
+                "gvc": self.namespace,
             },
         )
 
@@ -1258,6 +1274,7 @@ class CplnInfrastructure(Infrastructure):
         self._custom_logger = MetadataAdapter(self.logger)
 
         # Set necessary metadata for the upcoming logging
+        self._custom_logger.extra["gvc"] = job_namespace
         self._custom_logger.extra["workload_name"] = job_workload_name
         self._custom_logger.extra["command_id"] = job_workload_name
 
@@ -1505,10 +1522,18 @@ class CplnInfrastructure(Infrastructure):
         # Construct the path to start a new job in the specified location and workload
         path = f"/org/{self.org}/gvc/{self.namespace}/workload/{name}/-command"
 
+        # Construct the command tags from the k8s job labels
+        command_tags = dict(k8s_job["metadata"]["labels"])
+
+        # Tag the command with the agent/worker workload link if available
+        agent_workload = os.getenv("CPLN_WORKLOAD")
+        if agent_workload:
+            command_tags[CPLN_PREFECT_AGENT_TAG_KEY] = agent_workload
+
         # Construct the command to start a new job
         command = {
             "type": "runCronWorkload",
-            "tags": k8s_job["metadata"]["labels"],
+            "tags": command_tags,
             "spec": {
                 "location": self.location,
                 "containerOverrides": self.cpln_k8s_converter.build_container_overrides(),
@@ -1687,49 +1712,105 @@ class CplnInfrastructure(Infrastructure):
         Watches and monitors a job on the Control Plane platform, logging its status
         and handling its lifecycle stages.
 
+        Status monitoring (API polling) is the authoritative source for the job's
+        final state. Log streaming runs alongside it but never affects the outcome.
+        If status monitoring encounters transient API errors, the entire monitoring
+        session is retried up to MONITOR_MAX_RETRIES times. If the API remains
+        unreachable but the job is confirmed still running on CPLN, we return 0
+        to avoid falsely marking the flow run as crashed.
+
         Args:
-            logger (logging.Logger): Logger instance for recording job status updates.
+            client (CplnClient): The API client for interacting with the Control Plane.
             workload_name (str): The name of the job being monitored.
             job_id (str): The unique ID of the job being monitored.
-            configuration (CplnWorkerJobConfiguration): The configuration object containing
-                details about the job's namespace and organization.
-            client (CplnClient): The API client for interacting with the Control Plane.
 
         Returns:
             int: A status code representing the final state of the job:
-                - 0: Job completed successfully.
+                - 0: Job completed successfully, or job is still running on CPLN
+                     but monitoring could not be sustained (returns 0 to avoid
+                     falsely marking the flow run as crashed).
                 - 1: Job failed.
                 - 2: Job was cancelled.
-                - 3: Job is still running but logs can no longer be streamed.
         """
 
         # Log a message to indicate that the job is being monitored
         self._custom_logger.info("Monitoring job...")
 
-        # Initialize the logs monitor to stream logs for the specified job
-        logs_monitor = CplnLogsMonitor(
-            self._custom_logger,
-            client,
-            self.org,
-            self.namespace,
-            self.location,
-            workload_name,
-            job_id,
-        )
+        # Retry the entire monitoring session if status monitoring fails
+        # (e.g. the CPLN API becomes unreachable after max consecutive errors).
+        # Each retry creates a fresh CplnLogsMonitor to re-establish both the
+        # status polling and the WebSocket log streaming from scratch.
+        monitor_attempt = 0
 
-        try:
-            # Wait for the job to complete and handle logs
-            await asyncio.wait_for(
-                logs_monitor.monitor(lambda message: print(message)),
-                timeout=self.job_watch_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            self._custom_logger.error(
-                f"Job did not complete within timeout of {self.job_watch_timeout_seconds}s."
-            )
-            return -1
+        while True:
+            monitor_attempt += 1
 
-        # Make a GET request to fetch the job status
+            # Initialize the logs monitor to stream logs for the specified job
+            logs_monitor = CplnLogsMonitor(
+                self._custom_logger,
+                client,
+                self.org,
+                self.namespace,
+                self.location,
+                workload_name,
+                job_id,
+            )
+
+            try:
+                # Wait for the job to complete.
+                # monitor() only returns when status monitoring confirms a final
+                # lifecycle state. Log streaming failures do not cause early exit.
+                await asyncio.wait_for(
+                    logs_monitor.monitor(lambda message: print(message)),
+                    timeout=self.job_watch_timeout_seconds,
+                )
+
+                # monitor() returned normally — status monitoring confirmed the job finished
+                break
+
+            except asyncio.TimeoutError:
+                self._custom_logger.error(
+                    f"Job did not complete within timeout of {self.job_watch_timeout_seconds}s."
+                )
+                return -1
+
+            except Exception as e:
+                # Status monitoring failed (e.g. API unreachable after max consecutive errors).
+                self._custom_logger.warning(
+                    f"Status monitoring failed on attempt {monitor_attempt}/{MONITOR_MAX_RETRIES}: {e}",
+                    exc_info=True,
+                )
+
+                if monitor_attempt >= MONITOR_MAX_RETRIES:
+                    self._custom_logger.error(
+                        f"Max monitor retries ({MONITOR_MAX_RETRIES}) exceeded. "
+                        "Checking final job status before giving up."
+                    )
+                    break
+
+                # Brief check whether the job already finished despite the monitoring error
+                try:
+                    data = client.get(
+                        f"/org/{self.org}/gvc/{self.namespace}/workload/{workload_name}/-command/{job_id}"
+                    )
+                    lifecycle_stage = data.get("lifecycleStage")
+                    if lifecycle_stage in LIFECYCLE_FINAL_STAGES:
+                        self._custom_logger.info(
+                            f"Job reached final state '{lifecycle_stage}' despite monitoring error."
+                        )
+                        break
+                except Exception as status_err:
+                    self._custom_logger.warning(
+                        f"Could not check job status before retry: {status_err}"
+                    )
+
+                self._custom_logger.info(
+                    f"Job is still running. Retrying monitoring in {MONITOR_RETRY_DELAY_SECONDS}s "
+                    f"(attempt {monitor_attempt + 1}/{MONITOR_MAX_RETRIES})..."
+                )
+                await asyncio.sleep(MONITOR_RETRY_DELAY_SECONDS)
+
+        # Make a GET request to fetch the final job status
         data = client.get(
             f"/org/{self.org}/gvc/{self.namespace}/workload/{workload_name}/-command/{job_id}"
         )
@@ -1737,7 +1818,6 @@ class CplnInfrastructure(Infrastructure):
         # Extract the lifecycle stage from the response data
         lifecycle_stage = data.get("lifecycleStage")
 
-        # Determine the status code if not successful
         if lifecycle_stage == "failed":
             self._custom_logger.error("Job has failed.")
             return 1
@@ -1747,19 +1827,18 @@ class CplnInfrastructure(Infrastructure):
             return 2
 
         if lifecycle_stage == "pending" or lifecycle_stage == "running":
-            # Job is still running
-            self._custom_logger.error(
-                "An error occurred while waiting for the job to complete - job is still running, exiting...",
-                exc_info=True,
+            # The job is still running on Control Plane — do NOT mark it as crashed.
+            # Return 0 so the agent leaves the flow run in its current state.
+            # The bidirectional CPLN sync will pick up the final state when the job finishes.
+            self._custom_logger.warning(
+                "Monitoring could not be sustained but the job is still running on Control Plane. "
+                "Returning success to avoid marking the flow run as crashed. "
+                "The CPLN sync loop will reconcile the final state."
             )
+            return 0
 
-            # Return 3 to indicate that the job is still running
-            return 3
-
-        # Log a message to indicate that the job has completed successfully
+        # Job has completed successfully
         self._custom_logger.info("Job has completed successfully.")
-
-        # Return 0 to indicate that the job has completed successfully
         return 0
 
     async def _delete_workload(
@@ -2294,9 +2373,15 @@ async def watch_job_until_completion(
 
     Returns:
         str: The job status upon completion.
+
+    Raises:
+        Exception: If the maximum number of consecutive API errors is exceeded.
     """
 
+    logger = logging.getLogger(__name__)
+
     lifecycle_stage = None
+    consecutive_errors = 0
     delay_seconds = (
         interval_seconds if interval_seconds is not None else COMMAND_STATUS_CHECK_DELAY
     )
@@ -2308,16 +2393,32 @@ async def watch_job_until_completion(
             f"/org/{org}/gvc/{gvc}/workload/{workload_name}/-command/{command_id}"
         )
 
-        # Make a GET request to fetch the job status
-        command = client.get(command_link)
+        try:
+            # Make a GET request to fetch the job status
+            command = client.get(command_link)
 
-        # Extract the lifecycle stage from the response data and return it
-        lifecycle_stage = command["lifecycleStage"]
+            # Reset consecutive error count on success
+            consecutive_errors = 0
 
-        # If the job has completed, failed, or cancelled, set the flag to disconnect
-        if lifecycle_stage in LIFECYCLE_FINAL_STAGES:
-            # Set the completed flag to True to indicate completion
-            break
+            # Extract the lifecycle stage from the response data and return it
+            lifecycle_stage = command["lifecycleStage"]
+
+            # If the job has completed, failed, or cancelled, set the flag to disconnect
+            if lifecycle_stage in LIFECYCLE_FINAL_STAGES:
+                # Set the completed flag to True to indicate completion
+                break
+
+        except Exception as e:
+            consecutive_errors += 1
+            logger.warning(
+                f"Error fetching job status (attempt {consecutive_errors}/{COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS}): {e}"
+            )
+
+            if consecutive_errors >= COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS:
+                logger.error(
+                    f"Max consecutive status check errors ({COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS}) reached, giving up."
+                )
+                raise
 
         # Pause for a delay before checking the job status again
         await asyncio.sleep(delay_seconds)

@@ -501,9 +501,29 @@ class PrefectAgent:
 
                 if readiness_result and not isinstance(readiness_result, Exception):
                     try:
+                        # Parse the infrastructure PID to extract CPLN metadata
+                        # Format: "org:gvc:workload_name:command_id"
+                        pid_str = str(readiness_result)
+                        pid_parts = pid_str.split(":", 3)
+
+                        # Build CPLN tags to attach to the flow run for UI visibility
+                        cpln_tags = []
+                        if len(pid_parts) == 4:
+                            org_name, gvc_name, workload_name, command_id = pid_parts
+                            cpln_tags = [
+                                f"cpln:org:{org_name}",
+                                f"cpln:gvc:{gvc_name}",
+                                f"cpln:workload:{workload_name}",
+                                f"cpln:command:{command_id}",
+                            ]
+
+                        # Merge with existing flow run tags
+                        updated_tags = list(flow_run.tags or []) + cpln_tags
+
                         await self.client.update_flow_run(
                             flow_run_id=flow_run.id,
-                            infrastructure_pid=str(readiness_result),
+                            infrastructure_pid=pid_str,
+                            tags=updated_tags,
                         )
                     except Exception:
                         self.logger.exception(
@@ -698,7 +718,7 @@ class PrefectAgent:
             )
             return
 
-        self.logger.info(
+        self.logger.debug(
             "[CPLN] Starting regular job failure check — "
             "failed/missing jobs still marked as running in Prefect will be set to 'crashed'."
         )
@@ -728,7 +748,9 @@ class PrefectAgent:
 
         # If the running flow runs list is empty, exit early
         if not running_flow_runs:
-            self.logger.info("[CPLN] Regular job failure check complete.")
+            self.logger.debug(
+                "[CPLN] Regular job failure check complete — no running flow runs."
+            )
             return
 
         # Filter for flow runs with infrastructure PIDs (means they were submitted to CPLN)
@@ -737,7 +759,9 @@ class PrefectAgent:
         ]
 
         if not running_flow_runs_with_pid:
-            self.logger.info("[CPLN] Regular job failure check complete.")
+            self.logger.debug(
+                "[CPLN] Regular job failure check complete — no flow runs with infrastructure PIDs."
+            )
             return
 
         # Iterate over each flow run and check its CPLN job status directly using the infrastructure PID
@@ -835,27 +859,14 @@ class PrefectAgent:
                         pass  # Job is still running, nothing to do
 
                 except requests.exceptions.HTTPError as e:
-                    # 404 means the job no longer exists - mark as crashed
                     if e.response.status_code == 404:
+                        # 404 could be a transient API issue or the command was cleaned up.
+                        # Do not change the flow run state — the command may become
+                        # queryable again on a future sync cycle.
                         self.logger.warning(
-                            f"[CPLN] Flow run '{flow_run.id}' has infrastructure PID '{flow_run.infrastructure_pid}' "
-                            f"but the CPLN job no longer exists (404). Marking flow run as crashed."
+                            f"[CPLN] Got 404 when checking job '{command_id}' for flow run '{flow_run.id}'. "
+                            f"Skipping — will retry on the next sync cycle."
                         )
-                        try:
-                            await self._mark_flow_run_as_crashed(
-                                flow_run,
-                                state_updates={
-                                    "message": (
-                                        f"CPLN job '{command_id}' no longer exists. "
-                                        "The job may have crashed and been cleaned up."
-                                    )
-                                },
-                            )
-                        except Exception as mark_err:
-                            self.logger.error(
-                                f"[CPLN] Failed to update flow run '{flow_run.id}' state to crashed: {mark_err}",
-                                exc_info=True,
-                            )
                     else:
                         self.logger.error(
                             f"[CPLN] Failed to check status of job '{command_id}' for flow run '{flow_run.id}': {e.response.text}",
@@ -915,7 +926,7 @@ class PrefectAgent:
             )
             return
 
-        self.logger.info(
+        self.logger.debug(
             "[CPLN] Starting terminal flow run cleanup — "
             "terminal flow runs with active CPLN jobs will have those jobs terminated."
         )
@@ -952,7 +963,9 @@ class PrefectAgent:
 
         # If no terminal flow runs, exit early
         if not terminal_flow_runs:
-            self.logger.info("[CPLN] Terminal flow run cleanup complete.")
+            self.logger.debug(
+                "[CPLN] Terminal flow run cleanup complete — no terminal flow runs."
+            )
             return
 
         # Filter for flow runs with infrastructure PIDs (means they were executed on CPLN)
@@ -961,7 +974,9 @@ class PrefectAgent:
         ]
 
         if not terminal_flow_runs_with_pid:
-            self.logger.info("[CPLN] Terminal flow run cleanup complete.")
+            self.logger.debug(
+                "[CPLN] Terminal flow run cleanup complete — no flow runs with infrastructure PIDs."
+            )
             return
 
         # For each terminal flow run, check if its CPLN job is still active
