@@ -43,15 +43,15 @@ else:
 ### Constants ###
 
 # Jobs Related
-COMMAND_STATUS_CHECK_DELAY: int = 5
-COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS: int = 5
+COMMAND_STATUS_CHECK_DELAY: int = 30
+COMMAND_STATUS_CHECK_MAX_CONSECUTIVE_ERRORS: int = 10
 JOB_WATCH_OFFSET_MINUTES: int = 5
 LIFECYCLE_FINAL_STAGES: List[str] = ["completed", "failed", "cancelled"]
 ORPHAN_TTL_HOURS: int = 24  # To determine whether a workload is orphaned or not
 
 # Monitor Related
 MONITOR_MAX_RETRIES: int = 3
-MONITOR_RETRY_DELAY_SECONDS: int = 10
+MONITOR_RETRY_DELAY_SECONDS: int = 30
 
 # Retry Related
 RETRY_MAX_ATTEMPTS = 3
