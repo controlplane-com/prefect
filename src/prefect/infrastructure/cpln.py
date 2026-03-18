@@ -381,7 +381,7 @@ class CplnKubernetesConverter:
         workload_spec = {
             "type": "cron",
             "containers": self._build_cpln_workload_containers(
-                volume_name_to_volume, pod_spec["containers"][0]
+                volume_name_to_volume, pod_spec["containers"]
             ),
             "job": self._build_cpln_workload_job_spec(pod_spec),
             "defaultOptions": {
@@ -437,42 +437,44 @@ class CplnKubernetesConverter:
     def build_container_overrides(self):
         """Builds container overrides for cron workload job."""
 
-        # Get the pod spec from the job
-        kubernetes_container: dict = self._k8s_job["spec"]["template"]["spec"][
-            "containers"
-        ][0]
+        kubernetes_containers = self._k8s_job["spec"]["template"]["spec"]["containers"]
+        overrides = []
 
-        # Get container resources
-        resources = self._convert_kubernetes_job_resources(kubernetes_container)
+        for i, kubernetes_container in enumerate(kubernetes_containers):
+            is_primary = i == 0
+            resources = self._convert_kubernetes_job_resources(kubernetes_container)
 
-        # Initialize the container override
-        containerOverride = {
-            "name": DEFAULT_CONTAINER_NAME,
-            "image": kubernetes_container["image"],
-            "cpu": resources["cpu"],
-            "memory": resources["memory"],
-        }
+            container_override = {
+                "name": DEFAULT_CONTAINER_NAME
+                if is_primary
+                else kubernetes_container.get("name", f"sidecar-{i}"),
+                "image": kubernetes_container["image"]
+                if is_primary
+                else kubernetes_container.get("image", DEFAULT_CONTAINER_IMAGE),
+                "cpu": resources["cpu"],
+                "memory": resources["memory"],
+            }
 
-        # Set command if specified
-        if kubernetes_container.get("command"):
-            containerOverride["command"] = " ".join(kubernetes_container["command"])
+            if kubernetes_container.get("command"):
+                container_override["command"] = " ".join(
+                    kubernetes_container["command"]
+                )
 
-        # Set args if specified
-        if kubernetes_container.get("args"):
-            containerOverride["args"] = kubernetes_container["args"]
+            if kubernetes_container.get("args"):
+                container_override["args"] = kubernetes_container["args"]
 
-        # Set environment variables
-        if kubernetes_container.get("env"):
-            containerOverride["env"] = kubernetes_container["env"]
+            if kubernetes_container.get("env"):
+                container_override["env"] = kubernetes_container["env"]
 
-        # Process envFrom attribute and merge it with container env
-        if kubernetes_container.get("envFrom"):
-            containerOverride["env"] += self._process_env_from(
-                kubernetes_container["envFrom"]
-            )
+            if kubernetes_container.get("envFrom"):
+                container_override.setdefault("env", [])
+                container_override["env"] += self._process_env_from(
+                    kubernetes_container["envFrom"]
+                )
 
-        # Return an array that includes the container override
-        return [containerOverride]
+            overrides.append(container_override)
+
+        return overrides
 
     def create_reliant_resources(self):
         """
@@ -552,43 +554,82 @@ class CplnKubernetesConverter:
         }
 
     def _build_cpln_workload_containers(
-        self, kubernetes_volumes: dict, kubernetes_container: dict
+        self, kubernetes_volumes: dict, kubernetes_containers: list
     ) -> list:
         """
-        Builds a Control Plane cron workload container from a Kubernetes container.
+        Builds Control Plane cron workload containers from Kubernetes containers.
+
+        All containers must be present in the workload spec at creation time
+        because containerOverrides can only override existing containers — they
+        cannot add new ones. The first container is the primary Prefect job
+        container (uses defaults); additional containers are sidecars with their
+        full immutable properties (ports, volumes, workingDir, lifecycle, env).
 
         Args:
             kubernetes_volumes: The Kubernetes Job volumes.
-            kubernetes_container: The Kubernetes container.
+            kubernetes_containers: The Kubernetes containers list.
 
         Returns:
             list: The Control Plane cron workload containers.
         """
 
-        # Build workload container
-        container = {
-            "name": DEFAULT_CONTAINER_NAME,
-            "image": DEFAULT_CONTAINER_IMAGE,
-            "cpu": DEFAULT_CONTAINER_RESOURCES["cpu"],
-            "memory": DEFAULT_CONTAINER_RESOURCES["memory"],
-        }
+        containers = []
 
-        # Set working directory
-        if kubernetes_container.get("workingDir"):
-            container["workingDir"] = kubernetes_container["workingDir"]
+        for i, kubernetes_container in enumerate(kubernetes_containers):
+            if i == 0:
+                # Primary Prefect job container uses defaults
+                container = {
+                    "name": DEFAULT_CONTAINER_NAME,
+                    "image": DEFAULT_CONTAINER_IMAGE,
+                    "cpu": DEFAULT_CONTAINER_RESOURCES["cpu"],
+                    "memory": DEFAULT_CONTAINER_RESOURCES["memory"],
+                }
+            else:
+                # Sidecar containers need their full spec since overrides
+                # only support name, image, cpu, memory, command, args, env
+                resources = self._convert_kubernetes_job_resources(kubernetes_container)
+                container = {
+                    "name": kubernetes_container.get("name", f"sidecar-{i}"),
+                    "image": kubernetes_container.get("image", DEFAULT_CONTAINER_IMAGE),
+                    "cpu": resources["cpu"],
+                    "memory": resources["memory"],
+                }
 
-        # Set volume mounts
-        if kubernetes_container.get("volumeMounts"):
-            container["volumes"] = self._build_cpln_workload_volumes(
-                kubernetes_volumes, kubernetes_container["volumeMounts"]
-            )
+                # Set ports
+                if kubernetes_container.get("ports"):
+                    container["ports"] = [
+                        {
+                            "protocol": p.get("protocol", "TCP").lower(),
+                            "number": p["containerPort"],
+                        }
+                        for p in kubernetes_container["ports"]
+                    ]
 
-        # Set lifecycle
-        if kubernetes_container.get("lifecycle"):
-            container["lifecycle"] = kubernetes_container["lifecycle"]
+                # Set env (skip valueFrom entries — only plain values)
+                if kubernetes_container.get("env"):
+                    container["env"] = [
+                        {"name": e["name"], "value": e["value"]}
+                        for e in kubernetes_container["env"]
+                        if "value" in e
+                    ]
 
-        # Return the containers list
-        return [container]
+            # Set working directory
+            if kubernetes_container.get("workingDir"):
+                container["workingDir"] = kubernetes_container["workingDir"]
+
+            # Set volume mounts
+            if kubernetes_container.get("volumeMounts"):
+                container["volumes"] = self._build_cpln_workload_volumes(
+                    kubernetes_volumes, kubernetes_container["volumeMounts"]
+                )
+
+            # Set lifecycle
+            if kubernetes_container.get("lifecycle"):
+                container["lifecycle"] = kubernetes_container["lifecycle"]
+
+            containers.append(container)
+
+        return containers
 
     def _process_env_from(self, kubernetes_env_from: List[dict]) -> List[dict]:
         """
@@ -683,6 +724,10 @@ class CplnKubernetesConverter:
         for k8s_volume_mount in kubernetes_volume_mounts:
             # Skip if the volume is not found
             if not kubernetes_volumes.get(k8s_volume_mount["name"]):
+                self._logger.warning(
+                    f"Volume mount '{k8s_volume_mount['name']}' references a "
+                    f"volume that does not exist in the pod spec — skipping."
+                )
                 continue
 
             # Get the volume
@@ -1312,7 +1357,7 @@ class CplnInfrastructure(Infrastructure):
 
     def _build_job(self) -> KubernetesObjectManifest:
         """Builds the Kubernetes Job Manifest"""
-        job_manifest = copy.copy(self.job)
+        job_manifest = copy.deepcopy(self.job)
         job_manifest = self._shortcut_customizations().apply(job_manifest)
         job_manifest = self.customizations.apply(job_manifest)
         return job_manifest
