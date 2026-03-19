@@ -441,38 +441,33 @@ class CplnKubernetesConverter:
         overrides = []
 
         for i, kubernetes_container in enumerate(kubernetes_containers):
-            is_primary = i == 0
             resources = self._convert_kubernetes_job_resources(kubernetes_container)
 
-            container_override = {
+            override = {
                 "name": DEFAULT_CONTAINER_NAME
-                if is_primary
+                if i == 0
                 else kubernetes_container.get("name", f"sidecar-{i}"),
-                "image": kubernetes_container["image"]
-                if is_primary
-                else kubernetes_container.get("image", DEFAULT_CONTAINER_IMAGE),
+                "image": kubernetes_container.get("image", DEFAULT_CONTAINER_IMAGE),
                 "cpu": resources["cpu"],
                 "memory": resources["memory"],
             }
 
             if kubernetes_container.get("command"):
-                container_override["command"] = " ".join(
-                    kubernetes_container["command"]
-                )
+                override["command"] = " ".join(kubernetes_container["command"])
 
             if kubernetes_container.get("args"):
-                container_override["args"] = kubernetes_container["args"]
+                override["args"] = kubernetes_container["args"]
 
             if kubernetes_container.get("env"):
-                container_override["env"] = kubernetes_container["env"]
+                override["env"] = kubernetes_container["env"]
 
             if kubernetes_container.get("envFrom"):
-                container_override.setdefault("env", [])
-                container_override["env"] += self._process_env_from(
+                override.setdefault("env", [])
+                override["env"] += self._process_env_from(
                     kubernetes_container["envFrom"]
                 )
 
-            overrides.append(container_override)
+            overrides.append(override)
 
         return overrides
 
@@ -561,9 +556,9 @@ class CplnKubernetesConverter:
 
         All containers must be present in the workload spec at creation time
         because containerOverrides can only override existing containers — they
-        cannot add new ones. The first container is the primary Prefect job
-        container (uses defaults); additional containers are sidecars with their
-        full immutable properties (ports, volumes, workingDir, lifecycle, env).
+        cannot add new ones. Both primary and sidecar containers use minimal
+        defaults here; actual image, cpu, memory, and env are applied via
+        containerOverrides at job start time to keep the spec hash stable.
 
         Args:
             kubernetes_volumes: The Kubernetes Job volumes.
@@ -585,33 +580,15 @@ class CplnKubernetesConverter:
                     "memory": DEFAULT_CONTAINER_RESOURCES["memory"],
                 }
             else:
-                # Sidecar containers need their full spec since overrides
-                # only support name, image, cpu, memory, command, args, env
-                resources = self._convert_kubernetes_job_resources(kubernetes_container)
+                # Sidecar containers use defaults — actual image, cpu, memory,
+                # and env are applied via containerOverrides at job start time.
+                # This keeps the workload spec (and its hash) stable.
                 container = {
                     "name": kubernetes_container.get("name", f"sidecar-{i}"),
-                    "image": kubernetes_container.get("image", DEFAULT_CONTAINER_IMAGE),
-                    "cpu": resources["cpu"],
-                    "memory": resources["memory"],
+                    "image": DEFAULT_CONTAINER_IMAGE,
+                    "cpu": DEFAULT_CONTAINER_RESOURCES["cpu"],
+                    "memory": DEFAULT_CONTAINER_RESOURCES["memory"],
                 }
-
-                # Set ports
-                if kubernetes_container.get("ports"):
-                    container["ports"] = [
-                        {
-                            "protocol": p.get("protocol", "TCP").lower(),
-                            "number": p["containerPort"],
-                        }
-                        for p in kubernetes_container["ports"]
-                    ]
-
-                # Set env (skip valueFrom entries — only plain values)
-                if kubernetes_container.get("env"):
-                    container["env"] = [
-                        {"name": e["name"], "value": e["value"]}
-                        for e in kubernetes_container["env"]
-                        if "value" in e
-                    ]
 
             # Set working directory
             if kubernetes_container.get("workingDir"):
