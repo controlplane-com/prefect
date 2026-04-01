@@ -253,7 +253,7 @@ async def start(
                 tg.start_soon(
                     partial(
                         critical_service_loop,
-                        agent.sync_failed_cpln_jobs_with_prefect,
+                        agent.sync_cpln_to_prefect,
                         PREFECT_AGENT_CPLN_MONITOR_INTERVAL.value(),
                         printer=app.console.print,
                         run_once=run_once,
@@ -265,7 +265,7 @@ async def start(
                 tg.start_soon(
                     partial(
                         critical_service_loop,
-                        agent.sync_prefect_terminal_flow_runs_with_cpln,
+                        agent.sync_prefect_to_cpln,
                         PREFECT_AGENT_CPLN_MONITOR_INTERVAL.value(),
                         printer=app.console.print,
                         run_once=run_once,

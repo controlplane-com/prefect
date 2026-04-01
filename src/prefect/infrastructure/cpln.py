@@ -93,7 +93,15 @@ KubernetesObjectManifest = Dict[str, Any]
 
 class MetadataAdapter(logging.LoggerAdapter):
     """
-    LoggerAdapter that injects Kubernetes flow-run metadata into each log message.
+    LoggerAdapter that prefixes log messages with [CPLN] <Area> and contextual metadata.
+
+    Format: [CPLN] <Area> | <metadata> > <message>
+    or:     [CPLN] <Area> > <message>  (when no metadata)
+
+    This enables hierarchical LogQL filtering:
+      |= "[CPLN]"          — all CPLN logs
+      |= "[CPLN] Job"      — job lifecycle only
+      |= "[CPLN] Workload" — workload management only
     """
 
     def __init__(self, logger, extra=None):
@@ -105,42 +113,30 @@ class MetadataAdapter(logging.LoggerAdapter):
                 "gvc": None,
                 "workload_name": None,
                 "command_id": None,
+                "area": "",
             },
         )
 
     def process(self, msg, kwargs):
-        # Retrieve the job labels
-        labels = self.extra["k8s_labels"]
+        area = self.extra.get("area", "")
+        labels = self.extra.get("k8s_labels", {})
+        meta_parts = []
 
-        # Initialize metadata string
-        meta = ""
-
-        # Add flow name to metadata if available
         if labels.get("prefect.io/flow-name"):
-            meta += f", Flow Name: {labels['prefect.io/flow-name']}"
-
-        # Add flow run ID to metadata if available
+            meta_parts.append(f"Flow: {labels['prefect.io/flow-name']}")
         if labels.get("prefect.io/flow-run-id"):
-            meta += f", Flow Run ID: {labels['prefect.io/flow-run-id']}"
-
-        # Add flow run name to metadata if available
-        if labels.get("prefect.io/flow-run-name"):
-            meta += f", Flow Run Name: {labels['prefect.io/flow-run-name']}"
-
-        # Add GVC to metadata if provided
+            meta_parts.append(f"RunID: {labels['prefect.io/flow-run-id']}")
         if self.extra.get("gvc"):
-            meta += f", GVC: {self.extra['gvc']}"
-
-        # Add workload name to metadata if provided
+            meta_parts.append(f"GVC: {self.extra['gvc']}")
         if self.extra.get("workload_name"):
-            meta += f", Workload Name: {self.extra['workload_name']}"
-
-        # Add command ID to metadata if provided
+            meta_parts.append(f"Workload: {self.extra['workload_name']}")
         if self.extra.get("command_id"):
-            meta += f", Command ID: {self.extra['command_id']}"
+            meta_parts.append(f"Cmd: {self.extra['command_id']}")
 
-        # Prefix the message with metadata and return
-        return f"[CplnInfrastructure{meta}] {msg}", kwargs
+        meta = ", ".join(meta_parts)
+        if meta:
+            return f"[CPLN] Infrastructure > {area} | {meta} > {msg}", kwargs
+        return f"[CPLN] Infrastructure > {area} > {msg}", kwargs
 
 
 class CplnLogsMonitor:
@@ -1195,6 +1191,7 @@ class CplnInfrastructure(Infrastructure):
             {
                 "k8s_labels": k8s_job_metadata_labels,
                 "gvc": self.namespace,
+                "area": "Job",
             },
         )
 
@@ -1215,6 +1212,7 @@ class CplnInfrastructure(Infrastructure):
         )
 
         # Create the cron workload
+        self._custom_logger.extra["area"] = "Workload"
         workload = self._find_or_create_workload(client)
 
         # Extract the job name from the job manifest
@@ -1238,6 +1236,7 @@ class CplnInfrastructure(Infrastructure):
         self._custom_logger.info("Workload is ready!")
 
         # Start the job
+        self._custom_logger.extra["area"] = "Job"
         job_id = self._start_job(client, workload, k8s_job)
         self._custom_logger.extra["command_id"] = job_id
 
@@ -1257,6 +1256,7 @@ class CplnInfrastructure(Infrastructure):
         status_code = await self._watch_job(client, workload_name, job_id)
 
         # Cleanup orphaned workloads
+        self._custom_logger.extra["area"] = "Cleanup"
         try:
             self._cleanup_orphaned_workloads(client)
         except requests.exceptions.HTTPError as e:
@@ -1293,12 +1293,16 @@ class CplnInfrastructure(Infrastructure):
         )
 
         # Use the metadata logger adapter for logging
-        self._custom_logger = MetadataAdapter(self.logger)
-
-        # Set necessary metadata for the upcoming logging
-        self._custom_logger.extra["gvc"] = job_namespace
-        self._custom_logger.extra["workload_name"] = job_workload_name
-        self._custom_logger.extra["command_id"] = job_workload_name
+        self._custom_logger = MetadataAdapter(
+            self.logger,
+            {
+                "k8s_labels": {},
+                "gvc": job_namespace,
+                "workload_name": job_workload_name,
+                "command_id": job_workload_name,
+                "area": "Kill",
+            },
+        )
 
         # Wait for the grace period before killing the job
         await asyncio.sleep(grace_seconds)
@@ -1603,14 +1607,14 @@ class CplnInfrastructure(Infrastructure):
             # Iterate over each deployment and attempt to find the job within job executions
             for deployment in deployments:
                 # If there are no job executions, skip deployment
-                if not deployment.get("jobExecutions", {}):
+                if not deployment.get("status", {}).get("jobExecutions"):
                     continue
 
                 # Declare a variable to indicate if the specified job is found
                 is_found = False
 
                 # Iterate over each job execution and attempt to find the job to stop
-                for job in deployment["jobExecutions"]:
+                for job in deployment["status"]["jobExecutions"]:
                     # Check if the name of the job includes the command id, and skip if not
                     if command_id not in job.get("name", ""):
                         continue
@@ -1767,9 +1771,16 @@ class CplnInfrastructure(Infrastructure):
         while True:
             monitor_attempt += 1
 
+            # Create a dedicated adapter for the logs monitor so its area ("Logs")
+            # doesn't interfere with _watch_job's area ("Job") during concurrent execution
+            logs_logger = MetadataAdapter(
+                self._custom_logger.logger,
+                {**self._custom_logger.extra, "area": "Logs"},
+            )
+
             # Initialize the logs monitor to stream logs for the specified job
             logs_monitor = CplnLogsMonitor(
-                self._custom_logger,
+                logs_logger,
                 client,
                 self.org,
                 self.namespace,
@@ -1890,6 +1901,20 @@ class CplnInfrastructure(Infrastructure):
         job_org_name, job_namespace, workload_name, _ = self._parse_infrastructure_pid(
             infrastructure_pid
         )
+
+        # Ensure the metadata logger is available with Kill area
+        if not hasattr(self, "_custom_logger") or self._custom_logger is None:
+            self._custom_logger = MetadataAdapter(
+                self.logger,
+                {
+                    "k8s_labels": {},
+                    "gvc": job_namespace,
+                    "workload_name": workload_name,
+                    "area": "Kill",
+                },
+            )
+        else:
+            self._custom_logger.extra["area"] = "Kill"
 
         # Check if the job is running in the expected namespace
         if job_namespace != self.namespace:
