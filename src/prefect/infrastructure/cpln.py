@@ -65,6 +65,8 @@ PREFECT_IDENTIFIER_TAG_KEY = "cpln/createdByPrefect"
 CPLN_WORKLOAD_SPEC_HASH_TAG_KEY = "cpln/specHash"
 CPLN_PREFECT_JOB_TYPE_TAG_KEY = "cpln/prefectJobType"
 CPLN_PREFECT_AGENT_TAG_KEY = "cpln/prefectAgent"
+CPLN_NAME_TAG_KEY = "cpln/name"
+PREFECT_FLOW_RUN_NAME_LABEL_KEY = "prefect.io/flow-run-name"
 
 # Workload Related
 DEFAULT_CONTAINER_NAME = "prefect-job"
@@ -1550,6 +1552,11 @@ class CplnInfrastructure(Infrastructure):
 
         # Construct the command tags from the k8s job labels
         command_tags = dict(k8s_job["metadata"]["labels"])
+
+        # Surface the Prefect flow run's friendly name so the UI can display it
+        flow_run_name = command_tags.get(PREFECT_FLOW_RUN_NAME_LABEL_KEY)
+        if flow_run_name:
+            command_tags[CPLN_NAME_TAG_KEY] = flow_run_name
 
         # Tag the command with the agent/worker workload link if available
         agent_workload = os.getenv("CPLN_WORKLOAD")
