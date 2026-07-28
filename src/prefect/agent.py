@@ -734,7 +734,7 @@ class PrefectAgent:
                 "Agent is not started. Use `async with PrefectAgent()...`"
             )
 
-        if not self.cpln_client:
+        if not self._ensure_cpln_client():
             self.logger.warning(
                 "[CPLN] Sync CPLN→Prefect > Skipping — CPLN client was not created successfully."
             )
@@ -985,7 +985,7 @@ class PrefectAgent:
                 "Agent is not started. Use `async with PrefectAgent()...`"
             )
 
-        if not self.cpln_client:
+        if not self._ensure_cpln_client():
             self.logger.warning(
                 "[CPLN] Sync Prefect→CPLN > Skipping — CPLN client was not created successfully."
             )
@@ -1392,6 +1392,30 @@ class PrefectAgent:
         # Return the CPLN client
         return cpln_client
 
+    def _ensure_cpln_client(self) -> bool:
+        """
+        Return True when a CPLN client is available, creating it if necessary.
+
+        Client creation can fail transiently (e.g. a connection reset while the
+        agent boots), so callers retry it on every invocation instead of relying
+        on a single attempt at startup.
+        """
+
+        # Attempt to create the client if it does not exist yet
+        if self.cpln_client is None:
+            try:
+                self.cpln_client = self._get_cpln_client()
+            except Exception as e:
+                # Creation must never raise here — sync loops and startup treat
+                # an unavailable client as a skip, not an error
+                self.logger.warning(
+                    f"[CPLN] Init > Failed to create the CPLN client: {e}",
+                    exc_info=True,
+                )
+
+        # Return whether the client is available
+        return self.cpln_client is not None
+
     # Context management ---------------------------------------------------------------
 
     async def start(self):
@@ -1401,7 +1425,7 @@ class PrefectAgent:
             anyio.CapacityLimiter(self.limit) if self.limit is not None else None
         )
         self.client = get_client()
-        self.cpln_client = self._get_cpln_client()
+        self._ensure_cpln_client()
         await self.client.__aenter__()
         await self.task_group.__aenter__()
 
