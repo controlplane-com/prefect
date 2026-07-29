@@ -1,5 +1,5 @@
 # The version of Python in the final image
-ARG PYTHON_VERSION=3.8
+ARG PYTHON_VERSION=3.10
 # The base image to use for the final image; Prefect and its Python requirements will
 # be installed in this image. The default is the official Python slim image.
 # The following images are also available in this file:
@@ -7,7 +7,7 @@ ARG PYTHON_VERSION=3.8
 # Any image tag can be used, but it must have apt and pip.
 ARG BASE_IMAGE=python:${PYTHON_VERSION}-slim
 # The version used to build the Python distributable.
-ARG BUILD_PYTHON_VERSION=3.8
+ARG BUILD_PYTHON_VERSION=3.10
 # THe version used to build the UI distributable.
 ARG NODE_VERSION=16.15
 # Any extra Python requirements to install
@@ -101,7 +101,7 @@ RUN apt-get update && \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pin the pip version
-RUN python -m pip install --no-cache-dir pip==23.3.1
+RUN python -m pip install --no-cache-dir pip==26.1.2
 
 # Install the base requirements separately so they cache
 COPY requirements-client.txt requirements.txt ./
